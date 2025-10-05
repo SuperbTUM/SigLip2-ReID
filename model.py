@@ -4,12 +4,12 @@ from siglip import SiglipvisionConfig, SiglipTextConfig, SiglipConfig, SiglipMod
 
 
 def load_weights(model_name, text_model_loaded=True):
-    model = transformers.SiglipModel.from_pretrained(model_name)
+    model = transformers.Siglip2Model.from_pretrained(model_name)
 
     model_dict = model.state_dict()
     vision_model_dict = model.vision_model.state_dict()
 
-    vision_config = SiglipvisionConfig(version="siglip2" if "siglip2" in model_name else "siglip")
+    vision_config = SiglipvisionConfig()
     text_config = SiglipTextConfig()
     siglip_config = SiglipConfig(text_config=text_config.__dict__, vision_config=vision_config.__dict__)
     reproduced_model = SiglipModel(siglip_config)

@@ -1,1 +1,1 @@
-This is a simplified pytorch version SigLip model, with a main reference of transformers code.
+This is a simplified pytorch version SigLip2 model, with a main reference of transformers code.

@@ -4,6 +4,7 @@ from constants import *
 import transformers
 import torch
 import torch.nn as nn
+from peft import get_peft_model, LoraConfig
 
 
 class SupConLoss(nn.Module):
@@ -71,23 +72,58 @@ class PromptLearner(nn.Module):
         
         return prompted_text_features
 
-def train_one_batch(image_tensor, text_label, image_label, device):
-    """
-    A quick example of training sigLip2 with LiT
-    """
-    tokenizer = transformers.Autotokenizer.from_pretrained(MODEL_NAME)
-    vl_model = model.load_weights(MODEL_NAME, False)
-    prompt_learner = PromptLearner(4, 768, ["example_class_" + str(i) for i in range(N_CLS)]).to(device)
-    
-    # Load optimizer
-    optimizer = torch.optim.Adam(prompt_learner.parameters(), lr=0.001, weight_decay=1e-4)
 
-    text_features = prompt_learner(vl_model.text_model, tokenizer)[text_label] # Get a batch of text embeddings
-    image_features = vl_model.get_image_features(image_tensor.to(device)) # This can be pre-loaded
+def LoRA_tuning_one_batch(image_label, text_label, device):
+    # --- Setup from before ---
+    base_model = model.load_weights(MODEL_NAME).to(device)
+    text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.1,
+    )
+    base_model.text_model = get_peft_model(base_model.text_model, lora_config)
+    lora_model = base_model
+    # --- End of previous setup ---
+
+
+    # 1. Instantiate the Prompt Learner
+    # We need to know the embedding dimension of our text model.
+    embedding_dim = lora_model.config.text_config.hidden_size
+    prompt_learner = PromptLearner(
+        num_prompt_tokens=4, # hyper-parameter
+        embedding_dim=embedding_dim,
+        class_names=["example_class_" + str(i) for i in range(N_CLS)]
+    ).to(device)
+
+    # 2. Define the Optimizer to train BOTH sets of parameters
+    # This is the crucial step: you combine the parameters from both the
+    # prompt_learner and the LoRA-adapted model.
+    trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
+    optimizer = torch.optim.Adam(trainable_params, lr=5e-4, weight_decay=1e-4)
+
+    # --- Conceptual Training Step ---
+
+    # Dummy inputs
+    images = torch.rand(2, 3, 224, 224).to(device) # Dummy images
+
+    # 3. Use the Prompt Learner
+    # Pass the initial embeddings through the prompt learner to get the combined embeddings.
+    modified_text_embeddings = prompt_learner(lora_model.text_model, text_tokenizer)
+
+    # 4. Forward pass through the LoRA-adapted model
+    # The model now receives the modified input.
+    # Note: This is a simplified forward pass. The actual call might differ based on the model.
+    # The key is that `modified_text_embeddings` is the input, not the original `token_embeddings`.
+    text_features = modified_text_embeddings[text_label]
+    image_features = lora_model.get_image_features(images)
+
+    # Your loss calculation and backpropagation would follow...
     optimizer.zero_grad()
     sup_con_loss = SupConLoss(device)
     loss = sup_con_loss(text_features, image_features, text_label, image_label) + \
             sup_con_loss(image_features, text_features, image_label, text_label)
     loss.backward()
     optimizer.step()
-    return loss
+    return loss.item()
