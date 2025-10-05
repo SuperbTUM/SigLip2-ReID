@@ -312,7 +312,7 @@ class SiglipAttention(nn.Module):
         return attention_output, attention_weights
 
 
-class SiglipMLP(nn.Module):
+class Siglip2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -335,7 +335,7 @@ class SiglipEncoderLayer(nn.Module):
         self.embed_dim = config.hidden_size
         self.self_attn = SiglipAttention(config)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(config)
+        self.mlp = Siglip2MLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(
@@ -363,7 +363,7 @@ class SiglipEncoderLayer(nn.Module):
         return hidden_states
 
 
-class SigLipEncoder(nn.Module):
+class Siglip2Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -395,7 +395,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
         self.attention = torch.nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True)
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(config)
+        self.mlp = Siglip2MLP(config)
 
     def forward(self, hidden_state):
         batch_size = hidden_state.shape[0]
@@ -418,7 +418,7 @@ class SiglipVisionTransformer(nn.Module):
 
         self.embeddings = SiglipVisionEmbedding(config) if config.version == "siglip" else Siglip2VisionEmbeddings(config)
 
-        self.encoder = SigLipEncoder(config)
+        self.encoder = Siglip2Encoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self.head = SiglipMultiheadAttentionPoolingHead(config)
 
@@ -496,7 +496,7 @@ class SiglipTextConfig:
     documentation from [`PretrainedConfig`] for more information.
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 32000):
+        vocab_size (`int`, *optional*, defaults to 256000):
             Vocabulary size of the Siglip text model. Defines the number of different tokens that can be represented by
             the `inputs_ids` passed when calling [`SiglipModel`].
         hidden_size (`int`, *optional*, defaults to 768):
@@ -529,7 +529,7 @@ class SiglipTextConfig:
 
     def __init__(
             self,
-            vocab_size=32000,
+            vocab_size=256000,
             hidden_size=768,
             intermediate_size=3072,
             num_hidden_layers=12,
@@ -598,13 +598,13 @@ class SiglipTextEmbeddings(nn.Module):
         return embeddings
 
 
-class SiglipTextTransformer(nn.Module):
+class Siglip2TextTransformer(nn.Module):
     def __init__(self, config: SiglipTextConfig):
         super().__init__()
         self.config = config
         embed_dim = config.hidden_size
         self.embeddings = SiglipTextEmbeddings(config)
-        self.encoder = SigLipEncoder(config)
+        self.encoder = Siglip2Encoder(config)
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
         self.head = nn.Linear(embed_dim, config.projection_size)
@@ -614,19 +614,26 @@ class SiglipTextTransformer(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            use_pooled_output: bool = True,
     ):
         r"""
         Returns:
 
         """
 
-        if input_ids is None:
-            raise ValueError("You have to specify input_ids")
-
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_shape[-1])
-
-        hidden_states = self.embeddings(input_ids=input_ids)
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+            input_ids = input_ids.view(-1, input_shape[-1])
+            # Default path: get embeddings from token IDs
+            hidden_states = self.embeddings(input_ids=input_ids)
+        elif inputs_embeds is not None:
+            # Prompt learning path: use the provided embeddings directly
+            hidden_states = inputs_embeds
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         # note: SigLIP's text model does not use a causal mask, unlike the original CLIP model.
         # expand attention_mask
@@ -645,13 +652,13 @@ class SiglipTextTransformer(nn.Module):
         pooled_output = last_hidden_state[:, -1, :]
         pooled_output = self.head(pooled_output)
 
-        return pooled_output
+        return pooled_output if use_pooled_output else last_hidden_state
 
 
 class SiglipTextModel(nn.Module):
     def __init__(self, config: SiglipTextConfig):
         super().__init__()
-        self.text_model = SiglipTextTransformer(config)
+        self.text_model = Siglip2TextTransformer(config)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.text_model.embeddings.token_embedding
@@ -663,6 +670,8 @@ class SiglipTextModel(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            use_pooled_output: bool = True,
     ):
         r"""
         Returns:
@@ -672,6 +681,8 @@ class SiglipTextModel(nn.Module):
         return self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            use_pooled_output=use_pooled_output
         )
 
 
@@ -694,7 +705,7 @@ class SiglipConfig(nn.Module):
             Dictionary of keyword arguments.
     ```"""
 
-    model_type = "siglip"
+    model_type = "siglip2"
     sub_configs = {"text_config": SiglipTextConfig, "vision_config": SiglipvisionConfig}
 
     def __init__(self, text_config=None, vision_config=None, **kwargs):
