@@ -71,21 +71,23 @@ class PromptLearner(nn.Module):
         
         return prompted_text_features
 
-def train_one_pair(text, image_tensor, text_label, image_label, device):
+def train_one_batch(image_tensor, text_label, image_label, device):
     """
     A quick example of training sigLip2 with LiT
     """
     tokenizer = transformers.Autotokenizer.from_pretrained(MODEL_NAME)
-    textual_inputs = tokenizer(text, padding=True, return_tensor="pt", return_attention_mask=True)
     vl_model = model.load_weights(MODEL_NAME, False)
-    # prompt_learner = PromptLearner(4, 768, ...)
+    prompt_learner = PromptLearner(4, 768, ["example_class_" + str(i) for i in range(N_CLS)]).to(device)
+    
     # Load optimizer
-    optimizer = torch.optim.Adam(vl_model.text_model.parameters(), lr=0.001, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(prompt_learner.parameters(), lr=0.001, weight_decay=1e-4)
 
-    text_features = vl_model.get_text_features(input_ids=textual_inputs["input_ids"], attention_mask=textual_inputs["attention_masks"])
-    image_features = vl_model.get_image_features(image_tensor) # This can be pre-loaded
+    text_features = prompt_learner(vl_model.text_model, tokenizer)[text_label] # Get a batch of text embeddings
+    image_features = vl_model.get_image_features(image_tensor.to(device)) # This can be pre-loaded
     optimizer.zero_grad()
     sup_con_loss = SupConLoss(device)
-    optimizer.step()
-    return sup_con_loss(text_features, image_features, text_label, image_label) + \
+    loss = sup_con_loss(text_features, image_features, text_label, image_label) + \
             sup_con_loss(image_features, text_features, image_label, text_label)
+    loss.backward()
+    optimizer.step()
+    return loss
