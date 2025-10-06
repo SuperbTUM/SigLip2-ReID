@@ -5,6 +5,7 @@ import transformers
 import torch
 import torch.nn as nn
 from peft import get_peft_model, LoraConfig
+from typing import List
 
 
 class SupConLoss(nn.Module):
@@ -31,7 +32,12 @@ class SupConLoss(nn.Module):
         return loss
     
 class PromptLearner(nn.Module):
-    def __init__(self, num_prompt_tokens, embedding_dim, class_names):
+    def __init__(self, 
+                 text_model,
+                 text_tokenizer,
+                 num_prompt_tokens, 
+                 embedding_dim, 
+                 class_names: List[str]):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
@@ -44,21 +50,20 @@ class PromptLearner(nn.Module):
         # Store tokenized class names
         self.class_names = class_names
         # Note: In a full implementation, you'd handle tokenization carefully here.
+        self.text_model = text_model
+        text_inputs = text_tokenizer(self.class_names, padding=True, return_tensors="pt").input_ids
+        self.text_input_embedding_layer = text_model.get_input_embeddings()
 
-    def forward(self, text_encoder, text_tokenizer):
-        # Tokenize the class names
-        text_inputs = text_tokenizer(self.class_names, padding=True, return_tensors="pt", return_attention_mask=True)
-        
-        # Get the standard word embeddings for class names
-        class_name_embs = text_encoder(text_inputs["input_ids"].to(self.prompt.device), text_inputs["attention_mask"].to(self.prompt.device),
-                                       use_pooled_output=False)
-        
-        # Get the learnable prompt
-        learnable_prompt = self.prompt
+        self.register_buffer("text_inputs", text_inputs)
+
+    def forward(self):
+        with torch.no_grad():
+            # Get the standard word embeddings for class names
+            class_name_embs = self.text_input_embedding_layer(self.text_inputs.to(self.prompt.device))
         
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
-        combined_embs = torch.cat([learnable_prompt, class_name_embs], dim=1)
+        combined_embs = torch.cat([self.prompt, class_name_embs], dim=1)
         
         # Pass the combined embeddings through the rest of the text encoder
         # This part requires a custom forward pass through the text model layers
@@ -68,7 +73,7 @@ class PromptLearner(nn.Module):
         # A simplified representation of passing through the encoder:
         # Note: The actual `transformers` implementation requires passing embeddings
         # through `model.text_model.encoder` and then `model.text_model.final_layer_norm`.
-        prompted_text_features = text_encoder(inputs_embeds=combined_embs)
+        prompted_text_features = self.text_model(inputs_embeds=combined_embs)
         
         return prompted_text_features
 
@@ -92,6 +97,8 @@ def LoRA_tuning_one_batch(image_label, text_label, device):
     # We need to know the embedding dimension of our text model.
     embedding_dim = lora_model.config.text_config.hidden_size
     prompt_learner = PromptLearner(
+        text_model=lora_model.text_model,
+        text_tokenizer=text_tokenizer,
         num_prompt_tokens=4, # hyper-parameter
         embedding_dim=embedding_dim,
         class_names=["example_class_" + str(i) for i in range(N_CLS)]
@@ -110,7 +117,7 @@ def LoRA_tuning_one_batch(image_label, text_label, device):
 
     # 3. Use the Prompt Learner
     # Pass the initial embeddings through the prompt learner to get the combined embeddings.
-    modified_text_embeddings = prompt_learner(lora_model.text_model, text_tokenizer)
+    modified_text_embeddings = prompt_learner()
 
     # 4. Forward pass through the LoRA-adapted model
     # The model now receives the modified input.

@@ -612,6 +612,9 @@ class Siglip2TextTransformer(nn.Module):
 
         self.head = nn.Linear(embed_dim, config.projection_size)
         self._use_flash_attention_2 = False
+    
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embeddings.token_embedding
 
     def forward(
             self,
