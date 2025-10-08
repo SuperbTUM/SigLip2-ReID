@@ -1,9 +1,11 @@
 import model
 from constants import *
+from data_preparation import *
 
 import transformers
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
 from peft import get_peft_model, LoraConfig
 from typing import List
 
@@ -77,8 +79,7 @@ class PromptLearner(nn.Module):
         
         return prompted_text_features
 
-
-def LoRA_tuning_one_batch(image_label, text_label, device):
+def tuning_preparation(device):
     # --- Setup from before ---
     base_model = model.load_weights(MODEL_NAME).to(device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -109,28 +110,53 @@ def LoRA_tuning_one_batch(image_label, text_label, device):
     # prompt_learner and the LoRA-adapted model.
     trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=5e-4, weight_decay=1e-4)
-
-    # --- Conceptual Training Step ---
-
-    # Dummy inputs
-    images = torch.rand(2, 3, 224, 224).to(device) # Dummy images
-
-    # 3. Use the Prompt Learner
-    # Pass the initial embeddings through the prompt learner to get the combined embeddings.
-    modified_text_embeddings = prompt_learner()
-
-    # 4. Forward pass through the LoRA-adapted model
-    # The model now receives the modified input.
-    # Note: This is a simplified forward pass. The actual call might differ based on the model.
-    # The key is that `modified_text_embeddings` is the input, not the original `token_embeddings`.
-    text_features = modified_text_embeddings[text_label]
-    image_features = lora_model.get_image_features(images)
-
-    # Your loss calculation and backpropagation would follow...
-    optimizer.zero_grad()
     sup_con_loss = SupConLoss(device)
-    loss = sup_con_loss(text_features, image_features, text_label, image_label) + \
-            sup_con_loss(image_features, text_features, image_label, text_label)
-    loss.backward()
-    optimizer.step()
-    return loss.item()
+    scaler = GradScaler()
+
+    return lora_model, prompt_learner, optimizer, scaler, sup_con_loss
+
+
+def LoRA_tuning(validation_dataloader, device):
+    lora_model, prompt_learner, optimizer, scaler, sup_con_loss = tuning_preparation(device)
+    image_features_list = []
+    image_label_list = []
+    with torch.no_grad():
+        for batch in validation_dataloader:
+            image_tensor, label = batch[:2]
+            image_tensor = image_tensor.to(device)
+            label = label.to(device)
+            image_features = lora_model.get_image_features(image_tensor)
+            image_features_list.append(image_features)
+            image_label_list.append(label)
+    
+    image_features_list = torch.cat(image_features_list, dim=0).to(device)
+    image_label_list = torch.cat(image_label_list, dim=0)
+    pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), N_CLS // 16, 16)
+
+    for epoch in range(N_EPOCHS):
+        loss_by_epoch = 0
+        for iters, (indices_batch, label_batch) in enumerate(pk_sampler):
+            image_features_batch = image_features_list[indices_batch]
+            label_batch = torch.tensor(label_batch, device=device)
+            
+            optimizer.zero_grad()
+
+            with autocast():
+                # 3. Use the Prompt Learner
+                # Pass the initial embeddings through the prompt learner to get the combined embeddings.
+                modified_text_embeddings = prompt_learner()
+
+                # 4. Forward pass through the LoRA-adapted model
+                # The model now receives the modified input.
+                # Note: This is a simplified forward pass. The actual call might differ based on the model.
+                # The key is that `modified_text_embeddings` is the input, not the original `token_embeddings`.
+                text_features = modified_text_embeddings[label_batch]
+                
+                # Your loss calculation and backpropagation would follow...
+                loss = sup_con_loss(text_features, image_features_batch, label_batch, label_batch) + \
+                        sup_con_loss(image_features_batch, text_features, label_batch, label_batch)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            loss_by_epoch += loss.item()
+        print("Avg loss at epoch {} is {}.".format(epoch, loss_by_epoch / iters))
