@@ -1,5 +1,10 @@
 import random
 from collections import defaultdict
+from torchvision import transforms as T
+from torch.utils.data import DataLoader
+
+from base_dataset import ImageDataset
+from constants import *
 
 class PKsamplerWithLabels:
     """
@@ -54,3 +59,16 @@ class PKsamplerWithLabels:
 
     def __len__(self):
         return len(self.valid_labels) // self.p
+    
+def create_dataloader(dataset, input_size):
+    preprocessing = T.Compose([
+        T.Resize(input_size),
+        T.ToTensor(),
+        T.Normalize(mean=0.5, std=0.5)
+    ])
+    preprocessed_dataset = ImageDataset(dataset, preprocessing)
+    dataloader = DataLoader(preprocessed_dataset, 
+                            batch_size=BATCH_SIZE, 
+                            shuffle=True, 
+                            num_workers=4)
+    return dataloader

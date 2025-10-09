@@ -79,8 +79,11 @@ class PromptLearner(nn.Module):
         
         return prompted_text_features
 
-def tuning_preparation(device):
+def tuning_preparation(class_names, 
+                       device):
     # --- Setup from before ---
+    if isinstance(class_names, str):
+        class_names = [class_names] * N_CLS
     base_model = model.load_weights(MODEL_NAME).to(device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
     lora_config = LoraConfig(
@@ -100,9 +103,9 @@ def tuning_preparation(device):
     prompt_learner = PromptLearner(
         text_model=lora_model.text_model,
         text_tokenizer=text_tokenizer,
-        num_prompt_tokens=4, # hyper-parameter
+        num_prompt_tokens=N_PROMPT_TOKEN, # hyper-parameter
         embedding_dim=embedding_dim,
-        class_names=["example_class_" + str(i) for i in range(N_CLS)]
+        class_names=class_names
     ).to(device)
 
     # 2. Define the Optimizer to train BOTH sets of parameters
@@ -116,12 +119,16 @@ def tuning_preparation(device):
     return lora_model, prompt_learner, optimizer, scaler, sup_con_loss
 
 
-def LoRA_tuning(validation_dataloader, device):
-    lora_model, prompt_learner, optimizer, scaler, sup_con_loss = tuning_preparation(device)
+def LoRA_tuning(dataset, 
+                input_size, 
+                class_names,
+                device):
+    train_dataloader = create_dataloader(dataset, input_size)
+    lora_model, prompt_learner, optimizer, scaler, sup_con_loss = tuning_preparation(class_names, device)
     image_features_list = []
     image_label_list = []
     with torch.no_grad():
-        for batch in validation_dataloader:
+        for batch in train_dataloader:
             image_tensor, label = batch[:2]
             image_tensor = image_tensor.to(device)
             label = label.to(device)
