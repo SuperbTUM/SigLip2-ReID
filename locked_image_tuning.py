@@ -1,6 +1,7 @@
 import model
 from constants import *
 from data_preparation import *
+from evaluation import R1_mAP_eval_pt
 
 import transformers
 import torch
@@ -167,3 +168,20 @@ def LoRA_tuning(dataset,
             scaler.update()
             loss_by_epoch += loss.item()
         print("Avg loss at epoch {} is {}.".format(epoch, loss_by_epoch / iters))
+
+
+def test(model,
+         validation_dataloader,
+         device,
+         num_query):
+    evaluator = R1_mAP_eval_pt(num_query, 10)
+    for batch in validation_dataloader:
+        with torch.no_grad():
+            img, label, cam = batch[:3]
+            img = img.to(device)
+            label = label.to(device)
+            cam = cam.to(device)
+            test_feat = model.get_image_features(img)
+            evaluator.update((test_feat, label, cam))
+    cmc, mAP = evaluator.compute()[:2]
+    return cmc[0], cmc[4], cmc[9], mAP
