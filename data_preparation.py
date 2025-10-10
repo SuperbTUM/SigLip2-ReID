@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 
 from base_dataset import ImageDataset
 from constants import *
+from market import Market1501
 
 class PKsamplerWithLabels:
     """
@@ -60,15 +61,21 @@ class PKsamplerWithLabels:
     def __len__(self):
         return len(self.valid_labels) // self.p
     
-def create_dataloader(dataset, input_size):
+
+def create_dataloader(dataset_name, input_size, type):
     preprocessing = T.Compose([
         T.Resize(input_size),
         T.ToTensor(),
         T.Normalize(mean=0.5, std=0.5)
     ])
-    preprocessed_dataset = ImageDataset(dataset, preprocessing)
+    if dataset_name == "Market1501":
+        dataset = Market1501(verbose=False)
+    if type == "train":
+        preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
+    else:
+        preprocessed_dataset = ImageDataset(dataset.query + dataset.gallery, preprocessing)
     dataloader = DataLoader(preprocessed_dataset, 
                             batch_size=BATCH_SIZE, 
                             shuffle=True, 
                             num_workers=4)
-    return dataloader
+    return dataloader, None if type == "train" else len(dataset.query)

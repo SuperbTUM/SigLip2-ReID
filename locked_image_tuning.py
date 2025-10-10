@@ -114,18 +114,19 @@ def tuning_preparation(class_names,
     # prompt_learner and the LoRA-adapted model.
     trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=5e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
     sup_con_loss = SupConLoss(device)
     scaler = GradScaler()
 
-    return lora_model, prompt_learner, optimizer, scaler, sup_con_loss
+    return lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss
 
 
-def LoRA_tuning(dataset, 
+def LoRA_tuning(dataset_name, 
                 input_size, 
                 class_names,
                 device):
-    train_dataloader = create_dataloader(dataset, input_size)
-    lora_model, prompt_learner, optimizer, scaler, sup_con_loss = tuning_preparation(class_names, device)
+    train_dataloader = create_dataloader(dataset_name, input_size, "train")[0]
+    lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss = tuning_preparation(class_names, device)
     image_features_list = []
     image_label_list = []
     with torch.no_grad():
@@ -166,14 +167,16 @@ def LoRA_tuning(dataset,
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             loss_by_epoch += loss.item()
         print("Avg loss at epoch {} is {}.".format(epoch, loss_by_epoch / iters))
+    return lora_model.eval()
 
 
 def test(model,
-         validation_dataloader,
-         device,
-         num_query):
+         dataset_name,
+         device):
+    validation_dataloader, num_query = create_dataloader(dataset_name, INPUT_SIZE, "val")
     evaluator = R1_mAP_eval_pt(num_query, 10)
     for batch in validation_dataloader:
         with torch.no_grad():
@@ -185,3 +188,9 @@ def test(model,
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     return cmc[0], cmc[4], cmc[9], mAP
+
+if __name__ == "__main__":
+    dataset_name = "Market1501"
+    model = LoRA_tuning(dataset_name, INPUT_SIZE, "person", DEVICE)
+    cmc1, cmc5, cmc10, mAP = test(model, dataset_name, DEVICE)
+    print("cmc 1: {}, cmc 5: {}, cmc 10: {}, mAP: {}".format(cmc1, cmc5, cmc10, mAP))

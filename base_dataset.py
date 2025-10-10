@@ -2,8 +2,6 @@ from PIL import Image, ImageFile
 
 from torch.utils.data import Dataset
 import os.path as osp
-import random
-import torch
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
