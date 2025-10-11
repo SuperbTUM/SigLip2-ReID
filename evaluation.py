@@ -46,52 +46,47 @@ def eval_func_pt(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
         max_rank = num_g
         print(f"Note: number of gallery samples is quite small, got {num_g}")
 
-    # --- Vectorized Junk Image Removal ---
-    # Create masks for same-pid and same-camid
-    q_pids_view = q_pids.view(-1, 1).expand(-1, num_g)
-    g_pids_view = g_pids.view(1, -1).expand(num_q, -1)
-    q_camids_view = q_camids.view(-1, 1).expand(-1, num_g)
-    g_camids_view = g_camids.view(1, -1).expand(num_q, -1)
-    
-    # Junk images are those with same pid and same camid as the query
-    junk_mask = (q_pids_view == g_pids_view) & (q_camids_view == g_camids_view)
-    distmat.masked_fill_(junk_mask, float('inf'))
-    # ------------------------------------
-
-    indices = torch.argsort(distmat, dim=1)
-    
-    # `torch.gather` is a bit more explicit than direct indexing for this
-    matches = (g_pids[indices] == q_pids.view(-1, 1)).int()
-
     all_cmc = []
     all_AP = []
     num_valid_q = 0
 
-    for q_idx in range(num_q):
-        # The junk images are now at the end of the sorted list due to 'inf' distance
-        # and do not need to be manually removed from each query's results.
-        q_matches = matches[q_idx]
+    for i in range(0, num_q, 128): # Process in chunks of 128
+        distmat_chunk = distmat[i:i+128]
+        q_pids_chunk = q_pids[i:i+128]
+        q_camids_chunk = q_camids[i:i+128]
 
-        # Check if there are any correct matches in the gallery
-        if not torch.any(q_matches):
-            continue
+        # --- Vectorized Junk Image Removal for chunk ---
+        q_pids_view = q_pids_chunk.view(-1, 1).expand(-1, num_g)
+        g_pids_view = g_pids.view(1, -1).expand(distmat_chunk.shape[0], -1)
+        q_camids_view = q_camids_chunk.view(-1, 1).expand(-1, num_g)
+        g_camids_view = g_camids.view(1, -1).expand(distmat_chunk.shape[0], -1)
+        
+        junk_mask = (q_pids_view == g_pids_view) & (q_camids_view == g_camids_view)
+        distmat_chunk.masked_fill_(junk_mask, float('inf'))
+        # ------------------------------------
 
-        num_valid_q += 1
-        
-        # Compute CMC
-        cmc = q_matches.cumsum(0)
-        cmc[cmc > 1] = 1
-        all_cmc.append(cmc[:max_rank])
-        
-        # Compute Average Precision (AP)
-        num_rel = q_matches.sum()
-        positions = torch.nonzero(q_matches).squeeze()
-        
-        # Precision@k where k is the position of each correct match
-        precision_at_k = (torch.arange(1, num_rel + 1, device=device)) / (positions + 1.0)
-        AP = precision_at_k.mean()
-        all_AP.append(AP)
-        
+        indices_chunk = torch.argsort(distmat_chunk, dim=1)
+        matches_chunk = (g_pids[indices_chunk] == q_pids_chunk.view(-1, 1)).int()
+
+        for q_idx in range(distmat_chunk.shape[0]):
+            q_matches = matches_chunk[q_idx]
+
+            if not torch.any(q_matches):
+                continue
+
+            num_valid_q += 1
+            
+            cmc = q_matches.cumsum(0)
+            cmc[cmc > 1] = 1
+            all_cmc.append(cmc[:max_rank])
+            
+            num_rel = q_matches.sum()
+            positions = torch.nonzero(q_matches).squeeze()
+            
+            precision_at_k = (torch.arange(1, num_rel + 1, device=device)) / (positions + 1.0)
+            AP = precision_at_k.mean()
+            all_AP.append(AP)
+            
     if num_valid_q == 0:
         raise RuntimeError("Error: all query identities do not appear in gallery")
 
@@ -109,6 +104,7 @@ class R1_mAP_eval_pt():
         self.num_query = num_query
         self.max_rank = max_rank
         self.feat_norm = feat_norm
+        self.reset()
 
     def reset(self):
         self.feats = []

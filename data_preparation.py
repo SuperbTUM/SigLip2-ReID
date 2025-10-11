@@ -62,12 +62,23 @@ class PKsamplerWithLabels:
         return len(self.valid_labels) // self.p
     
 
-def create_dataloader(dataset_name, input_size, type):
-    preprocessing = T.Compose([
-        T.Resize(input_size),
-        T.ToTensor(),
-        T.Normalize(mean=0.5, std=0.5)
-    ])
+def create_dataloader(dataset_name, input_size, type, augmented):
+    if augmented:
+        preprocessing = T.Compose([
+            T.Resize(input_size),
+            T.RandomHorizontalFlip(0.5),
+            T.Pad(10),
+            T.RandomCrop(input_size),
+            T.ToTensor(),
+            T.Normalize(mean=0.5, std=0.5),
+            T.RandomErasing(),
+        ])
+    else:
+        preprocessing = T.Compose([
+            T.Resize(input_size),
+            T.ToTensor(),
+            T.Normalize(mean=0.5, std=0.5)
+        ])
     if dataset_name == "Market1501":
         dataset = Market1501(verbose=False)
     if type == "train":
@@ -77,5 +88,6 @@ def create_dataloader(dataset_name, input_size, type):
     dataloader = DataLoader(preprocessed_dataset, 
                             batch_size=BATCH_SIZE, 
                             shuffle=True, 
+                            sampler=PKsamplerWithLabels(dataset.train, BATCH_SIZE // 16, 16) if augmented else None,
                             num_workers=4)
-    return dataloader, None if type == "train" else len(dataset.query)
+    return dataloader, None if type == "train" else len(dataset.query), dataset.num_train_pids if type == "train" else None

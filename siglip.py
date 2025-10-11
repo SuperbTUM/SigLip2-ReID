@@ -444,7 +444,7 @@ class SiglipVisionTransformer(nn.Module):
         bs, n_patch, _ = image.size()
         current_length = n_patch
         padding_length = target_length - current_length
-        mask = torch.ones((bs, target_length), dtype=torch.int32)
+        mask = torch.ones((bs, target_length), dtype=torch.int32, device=image.device)
         if padding_length > 0:
             paddings = (0, 0, 0, padding_length)
             image = F.pad(image, paddings, mode="constant", value=pad_value)
@@ -751,8 +751,8 @@ class SiglipModel(nn.Module):
         vision_model = SiglipVisionModel(vision_config)
 
         # Second, get the text and vision submodules (for backward compatibility)
-        self.text_model = text_model.text_model
-        self.vision_model = vision_model.vision_model
+        self.text_model = text_model#.text_model
+        self.vision_model = vision_model#.vision_model
 
         self.logit_scale = nn.Parameter(torch.randn(1))
         self.logit_bias = nn.Parameter(torch.randn(1))

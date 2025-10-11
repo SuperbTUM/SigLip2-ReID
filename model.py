@@ -14,7 +14,8 @@ def load_weights(model_name, text_model_loaded=True):
     siglip_config = SiglipConfig(text_config=text_config.__dict__, vision_config=vision_config.__dict__)
     reproduced_model = SiglipModel(siglip_config)
     if text_model_loaded:
-        reproduced_model.load_state_dict(model_dict)
+        reproduced_model.vision_model.load_state_dict(model_dict, False)
+        reproduced_model.text_model.load_state_dict(model_dict, False)
     else:
         reproduced_model.vision_model.load_state_dict(vision_model_dict)
     reproduced_model.eval()

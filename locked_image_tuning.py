@@ -6,9 +6,12 @@ from evaluation import R1_mAP_eval_pt
 import transformers
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from peft import get_peft_model, LoraConfig
 from typing import List
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class SupConLoss(nn.Module):
@@ -83,9 +86,7 @@ class PromptLearner(nn.Module):
 def tuning_preparation(class_names, 
                        device):
     # --- Setup from before ---
-    if isinstance(class_names, str):
-        class_names = [class_names] * N_CLS
-    base_model = model.load_weights(MODEL_NAME).to(device)
+    base_model = model.load_weights(MODEL_NAME)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
     lora_config = LoraConfig(
         r=16,
@@ -94,7 +95,7 @@ def tuning_preparation(class_names,
         lora_dropout=0.1,
     )
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
-    lora_model = base_model
+    lora_model = base_model.to(device)
     # --- End of previous setup ---
 
 
@@ -112,11 +113,11 @@ def tuning_preparation(class_names,
     # 2. Define the Optimizer to train BOTH sets of parameters
     # This is the crucial step: you combine the parameters from both the
     # prompt_learner and the LoRA-adapted model.
-    trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
+    trainable_params = list(prompt_learner.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=5e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
     sup_con_loss = SupConLoss(device)
-    scaler = GradScaler()
+    scaler = GradScaler(device)
 
     return lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss
 
@@ -125,7 +126,9 @@ def LoRA_tuning(dataset_name,
                 input_size, 
                 class_names,
                 device):
-    train_dataloader = create_dataloader(dataset_name, input_size, "train")[0]
+    train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", False)
+    if isinstance(class_names, str):
+        class_names = [class_names] * n_cls
     lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss = tuning_preparation(class_names, device)
     image_features_list = []
     image_label_list = []
@@ -140,7 +143,7 @@ def LoRA_tuning(dataset_name,
     
     image_features_list = torch.cat(image_features_list, dim=0).to(device)
     image_label_list = torch.cat(image_label_list, dim=0)
-    pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), N_CLS // 16, 16)
+    pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), BATCH_SIZE // 16, 16)
 
     for epoch in range(N_EPOCHS):
         loss_by_epoch = 0
@@ -150,7 +153,7 @@ def LoRA_tuning(dataset_name,
             
             optimizer.zero_grad()
 
-            with autocast():
+            with autocast(device):
                 # 3. Use the Prompt Learner
                 # Pass the initial embeddings through the prompt learner to get the combined embeddings.
                 modified_text_embeddings = prompt_learner()
@@ -176,7 +179,7 @@ def LoRA_tuning(dataset_name,
 def test(model,
          dataset_name,
          device):
-    validation_dataloader, num_query = create_dataloader(dataset_name, INPUT_SIZE, "val")
+    validation_dataloader, num_query, _ = create_dataloader(dataset_name, INPUT_SIZE, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     for batch in validation_dataloader:
         with torch.no_grad():
