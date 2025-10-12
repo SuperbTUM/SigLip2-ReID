@@ -30,7 +30,7 @@ class VeRi(BaseImageDataset):
 
         self._check_before_run()
 
-        path_train = 'datasets/keypoint_train.txt'
+        path_train = 'keypoint_train.txt'
         with open(path_train, 'r') as txt:
             lines = txt.readlines()
         self.image_map_view_train = {}
@@ -39,7 +39,7 @@ class VeRi(BaseImageDataset):
             viewid = int(content[-1])
             self.image_map_view_train[osp.basename(content[0])] = viewid
 
-        path_test = 'datasets/keypoint_test.txt'
+        path_test = 'keypoint_test.txt'
         with open(path_test, 'r') as txt:
             lines = txt.readlines()
         self.image_map_view_test = {}
