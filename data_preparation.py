@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from base_dataset import ImageDataset
 from constants import *
 from market import Market1501
+from veri import VeRi
 
 class PKsamplerWithLabels:
     """
@@ -81,6 +82,8 @@ def create_dataloader(dataset_name, input_size, type, augmented):
         ])
     if dataset_name == "Market1501":
         dataset = Market1501(verbose=False)
+    elif dataset_name == "veri":
+        dataset = VeRi(verbose=False)
     if type == "train":
         preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
     else:

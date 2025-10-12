@@ -4,4 +4,6 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 pip3 install peft transformers gdown
 gdown 0B8-rUzbwVRk0c054eEozWG9COHM
 unzip -q Market-1501-v15.09.15.zip
+gdown 0B0o1ZxGs_oVZWmtFdXpqTGl3WUU
+unzip -q VeRi.zip
 python3 ./locked_image_tuning.py
