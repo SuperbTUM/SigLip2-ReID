@@ -6,9 +6,10 @@ from evaluation import R1_mAP_eval_pt
 import transformers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from peft import get_peft_model, LoraConfig
-from typing import List
+from typing import List, Optional
 import itertools
 
 import os
@@ -35,6 +36,67 @@ class SupConLoss(nn.Module):
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - mean_log_prob_pos.mean()
+
+        return loss
+
+class SupervisedSigmoidLoss(nn.Module):
+    """
+    A sigmoid-based loss inspired by Supervised Contrastive learning.
+
+    It can operate in two modes:
+    1.  Instance-level (default): Assumes image_i matches text_i.
+    2.  Supervised-level: If class_labels are provided, it treats all samples
+        with the same label as positive pairs.
+    """
+    def __init__(self, temperature: float = 10.0, reduction: str = 'mean'):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.tensor(temperature))
+        self.reduction = reduction
+
+    def forward(self, 
+              image_features: torch.Tensor, 
+              text_features: torch.Tensor,
+              class_labels: Optional[torch.Tensor] = None):
+        """
+        Computes the Supervised Sigmoid Loss.
+
+        Args:
+            image_features (torch.Tensor): Normalized image embeddings (N, D).
+            text_features (torch.Tensor): Normalized text embeddings (N, D).
+            class_labels (Optional[torch.Tensor]): A 1D tensor of class labels (N,).
+                                                   If None, performs standard instance-level
+                                                   matching.
+        
+        Returns:
+            torch.Tensor: The computed loss value.
+        """
+        image_features = F.normalize(image_features, p=2, dim=-1)
+        text_features = F.normalize(text_features, p=2, dim=-1)
+
+        logits = torch.matmul(image_features, text_features.t()) * self.temperature
+
+        if class_labels is None:
+            # Standard instance-level matching (image_i matches text_i)
+            labels = torch.eye(logits.shape[0], device=logits.device)
+        else:
+            # Supervised matching: pairs with the same class label are positives.
+            # Use broadcasting to create a matrix of label equality.
+            # Shape: (N, N)
+            labels = (class_labels.unsqueeze(0) == class_labels.unsqueeze(1)).float()
+
+        # We must ignore the loss for an item matched with itself if it's not
+        # the designated text pair in the instance-level case. In the supervised
+        # case, an item is always positive with itself.
+        # For simplicity here, we assume the main diagonal should always be positive.
+        if class_labels is not None:
+             labels.fill_diagonal_(1)
+
+
+        loss = F.binary_cross_entropy_with_logits(
+            logits,
+            labels,
+            reduction=self.reduction
+        )
 
         return loss
     
@@ -111,8 +173,8 @@ def tuning_preparation(class_names,
     # This is the crucial step: you combine the parameters from both the
     # prompt_learner and the LoRA-adapted model.
     trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
-    optimizer = torch.optim.Adam(trainable_params, lr=5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+    optimizer = torch.optim.Adam(trainable_params, lr=3.5e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
     sup_con_loss = SupConLoss(device)
     scaler = GradScaler(device)
 
@@ -211,9 +273,9 @@ def LoRA_tuning_variable_dataset(dataset_names,
         prompt_learners.append(prompt_learner)
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
-    optimizer = torch.optim.Adam(all_trainable_params, lr=5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
-    sup_con_loss = SupConLoss(device)
+    optimizer = torch.optim.Adam(all_trainable_params, lr=3.5e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
+    sup_con_loss = SupervisedSigmoidLoss().to(device)
     scaler = GradScaler(device)
 
     # --- Pre-extract image features for all datasets ---
@@ -260,8 +322,8 @@ def LoRA_tuning_variable_dataset(dataset_names,
                     modified_text_embeddings = prompt_learners[i](lora_model.text_model)
                     text_features = modified_text_embeddings[label_batch]
                     
-                    loss = sup_con_loss(text_features, image_features_batch, label_batch, label_batch) + \
-                           sup_con_loss(image_features_batch, text_features, label_batch, label_batch)
+                    loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
+                           sup_con_loss(image_features_batch, text_features, label_batch)
                     total_loss += loss
 
             scaler.scale(total_loss).backward()
