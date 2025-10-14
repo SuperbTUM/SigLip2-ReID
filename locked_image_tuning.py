@@ -70,8 +70,6 @@ class SupervisedSigmoidLoss(nn.Module):
         Returns:
             torch.Tensor: The computed loss value.
         """
-        image_features = F.normalize(image_features, p=2, dim=-1)
-        text_features = F.normalize(text_features, p=2, dim=-1)
 
         logits = torch.matmul(image_features, text_features.t()) * self.temperature
 
@@ -174,7 +172,7 @@ def tuning_preparation(class_names,
     # prompt_learner and the LoRA-adapted model.
     trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=3.5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
     sup_con_loss = SupConLoss(device)
     scaler = GradScaler(device)
 
@@ -204,7 +202,7 @@ def LoRA_tuning(dataset_name,
     image_label_list = torch.cat(image_label_list, dim=0)
     pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), BATCH_SIZE // 16, 16)
 
-    for epoch in range(N_EPOCHS):
+    for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
         for iters, (indices_batch, label_batch) in enumerate(pk_sampler):
             image_features_batch = image_features_list[indices_batch]
@@ -274,7 +272,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
     optimizer = torch.optim.Adam(all_trainable_params, lr=3.5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
     sup_con_loss = SupervisedSigmoidLoss().to(device)
     scaler = GradScaler(device)
 
@@ -302,7 +300,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
     # Use itertools.cycle to handle datasets of different sizes
     num_batches = max(len(sampler) for sampler in pk_samplers)
     
-    for epoch in range(N_EPOCHS):
+    for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
         
         # Create cyclic iterators for each sampler
@@ -332,9 +330,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
             scheduler.step()
             loss_by_epoch += total_loss.item()
 
-        print(f"Avg loss at epoch {epoch} is {loss_by_epoch / num_batches}.")
-
-    return lora_model.eval()
+    return lora_model.eval(), prompt_learners
 
 def test(model,
          dataset_name,
@@ -355,6 +351,6 @@ def test(model,
 if __name__ == "__main__":
     dataset_name = "Market1501"
     # model = LoRA_tuning(dataset_name, INPUT_SIZE, "person", DEVICE)
-    model = LoRA_tuning_variable_dataset(["Market1501", "veri"], [(256, 128), (224, 224)], ["person", "vehicle"], DEVICE)
+    model = LoRA_tuning_variable_dataset(["Market1501", "veri"], [(256, 128), (224, 224)], ["person", "vehicle"], DEVICE)[0]
     cmc1, cmc5, cmc10, mAP = test(model, dataset_name, DEVICE)
     print("Dataset: {}, cmc 1: {}, cmc 5: {}, cmc 10: {}, mAP: {}".format(dataset_name, cmc1, cmc5, cmc10, mAP))
