@@ -195,10 +195,12 @@ def vision_tuning_variable_dataset(lora_model,
         return torch.stack(anchors), torch.cat(positives), torch.cat(negatives)
 
     # --- Freeze prompt learners ---
+    modified_text_embeddings = []
     for prompt_learner in prompt_learners:
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
+        modified_text_embeddings.append(prompt_learner(text_model))
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 4  # Adjust as needed
@@ -228,8 +230,7 @@ def vision_tuning_variable_dataset(lora_model,
                     
                     # Sigmoid loss
                     with torch.no_grad():
-                        modified_text_embeddings = prompt_learners[i](text_model)
-                        text_features = modified_text_embeddings[label]
+                        text_features = modified_text_embeddings[i][label]
                     loss_sigmoid = sup_con_loss(image_features, text_features)
 
                     # Triplet loss
