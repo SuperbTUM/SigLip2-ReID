@@ -330,6 +330,8 @@ def LoRA_tuning_variable_dataset(dataset_names,
             scheduler.step()
             loss_by_epoch += total_loss.item()
 
+            print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
+
     return lora_model.eval(), prompt_learners
 
 def test(model,

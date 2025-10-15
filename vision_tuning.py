@@ -200,17 +200,18 @@ def vision_tuning_variable_dataset(lora_model,
             param.requires_grad = False
         prompt_learner.eval()
 
-    # --- Training Loop ---
+    # --- Training Loop (with Gradient Accumulation) ---
+    accumulation_steps = 4  # Adjust as needed
     num_batches = max(len(loader) for loader in train_dataloaders)
     
+    optimizer.zero_grad()
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
         
         # Create cyclic iterators for each dataloader
         dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
 
-        for _ in range(num_batches):
-            optimizer.zero_grad()
+        for batch_idx in range(num_batches):
             total_loss = 0
 
             for i, dataloader_iter in enumerate(dataloader_iters):
@@ -219,7 +220,7 @@ def vision_tuning_variable_dataset(lora_model,
                 label = label.to(device)
 
                 with autocast(device):
-                    image_features = vision_model(pixel_values=image_tensor)
+                    image_features = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
                     
                     # Cross-entropy loss
                     logits = classifiers[i](image_features)
@@ -238,13 +239,20 @@ def vision_tuning_variable_dataset(lora_model,
                         total_loss += loss_triplet
                     
                     total_loss += loss_ce + loss_sigmoid
-
+            
+            # Normalize loss for accumulation
+            total_loss = total_loss / accumulation_steps
+            
             scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            loss_by_epoch += total_loss.item()
 
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            loss_by_epoch += total_loss.item() * accumulation_steps
+
+        scheduler.step()
         print(f"Avg loss at epoch {epoch} is {loss_by_epoch / num_batches}.")
 
     return base_model.eval()
