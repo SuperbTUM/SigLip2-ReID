@@ -2,7 +2,6 @@ import model
 from constants import *
 from data_preparation import *
 from evaluation import R1_mAP_eval_pt
-from locked_image_tuning import LoRA_tuning_variable_dataset
 
 import torch
 import torch.nn as nn
@@ -10,6 +9,9 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from typing import List, Optional
 import itertools
+
+from peft import get_peft_model, LoraConfig
+from locked_image_tuning import LoRA_tuning_variable_dataset
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -28,8 +30,8 @@ class SupervisedSigmoidLoss(nn.Module):
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.reduction = reduction
 
-    def forward(self, 
-              image_features: torch.Tensor, 
+    def forward(self,
+              image_features: torch.Tensor,
               text_features: torch.Tensor,
               class_labels: Optional[torch.Tensor] = None):
         """
@@ -64,7 +66,6 @@ class SupervisedSigmoidLoss(nn.Module):
         if class_labels is not None:
              labels.fill_diagonal_(1)
 
-
         loss = F.binary_cross_entropy_with_logits(
             logits,
             labels,
@@ -74,10 +75,10 @@ class SupervisedSigmoidLoss(nn.Module):
         return loss
 
 class PromptLearner(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  text_tokenizer,
-                 num_prompt_tokens, 
-                 embedding_dim, 
+                 num_prompt_tokens,
+                 embedding_dim,
                  class_names: List[str]):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -116,20 +117,69 @@ class PromptLearner(nn.Module):
         
         return prompted_text_features
 
-def vision_tuning_variable_dataset(lora_model, 
+
+def mine_hard_triplets(features, labels, margin=0.3):
+    device = features.device
+    loss = torch.tensor(0.0, device=device)
+    num_triplets = 0
+
+    for i in range(len(labels)):
+        anchor_feature = features[i]
+        anchor_label = labels[i]
+
+        # Find hardest positive
+        is_pos = (labels == anchor_label) & (torch.arange(len(labels), device=device) != i)
+        if not torch.any(is_pos):
+            continue
+        
+        pos_features = features[is_pos]
+        pos_dists = torch.cdist(anchor_feature.unsqueeze(0), pos_features)
+        hardest_pos_dist, hardest_pos_idx = torch.max(pos_dists, dim=1)
+
+        # Find hardest negative
+        is_neg = labels != anchor_label
+        if not torch.any(is_neg):
+            continue
+
+        neg_features = features[is_neg]
+        neg_dists = torch.cdist(anchor_feature.unsqueeze(0), neg_features)
+        hardest_neg_dist, hardest_neg_idx = torch.min(neg_dists, dim=1)
+        
+        # Calculate triplet loss for this anchor
+        triplet_loss = F.relu(hardest_pos_dist[0] - hardest_neg_dist[0] + margin)
+        loss += triplet_loss
+        num_triplets += 1
+        
+    
+    if num_triplets == 0:
+        return torch.tensor(0.0, device=device)
+
+    return loss / num_triplets
+
+def LoRA_vision_tuning(base_model,
                                  prompt_learners,
                                  dataset_names,
                                  input_sizes,
                                  device):
-    # --- Use the passed lora_model and prompt_learners ---
-    base_model = lora_model
     
     # Freeze text model
     for param in base_model.text_model.parameters():
         param.requires_grad = False
     base_model.text_model.eval()
 
-    vision_model = base_model.vision_model.to(device)
+    # PEFT LoRA configuration
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.1,
+        bias="none",
+    )
+
+    vision_model = get_peft_model(base_model.vision_model, lora_config)
+    vision_model.print_trainable_parameters()
+    
+    vision_model = vision_model.to(device)
     text_model = base_model.text_model.to(device)
     embedding_dim = base_model.config.vision_config.hidden_size
 
@@ -151,44 +201,6 @@ def vision_tuning_variable_dataset(lora_model,
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
     sup_con_loss = SupervisedSigmoidLoss().to(device)
     scaler = GradScaler(device)
-
-    def mine_hard_triplets(features, labels, margin=0.3):
-        device = features.device
-        loss = torch.tensor(0.0, device=device)
-        num_triplets = 0
-
-        for i in range(len(labels)):
-            anchor_feature = features[i]
-            anchor_label = labels[i]
-
-            # Find hardest positive
-            is_pos = (labels == anchor_label) & (torch.arange(len(labels), device=device) != i)
-            if not torch.any(is_pos):
-                continue
-            
-            pos_features = features[is_pos]
-            pos_dists = torch.cdist(anchor_feature.unsqueeze(0), pos_features)
-            hardest_pos_dist, hardest_pos_idx = torch.max(pos_dists, dim=1)
-
-            # Find hardest negative
-            is_neg = labels != anchor_label
-            if not torch.any(is_neg):
-                continue
-
-            neg_features = features[is_neg]
-            neg_dists = torch.cdist(anchor_feature.unsqueeze(0), neg_features)
-            hardest_neg_dist, hardest_neg_idx = torch.min(neg_dists, dim=1)
-            
-            # Calculate triplet loss for this anchor
-            triplet_loss = F.relu(hardest_pos_dist[0] - hardest_neg_dist[0] + margin)
-            loss += triplet_loss
-            num_triplets += 1
-            
-        
-        if num_triplets == 0:
-            return torch.tensor(0.0, device=device)
-
-        return loss / num_triplets
 
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
@@ -227,6 +239,7 @@ def vision_tuning_variable_dataset(lora_model,
                     # Sigmoid loss
                     with torch.no_grad():
                         text_features = modified_text_embeddings[i][label]
+                    
                     loss_sigmoid = sup_con_loss(image_features, text_features)
 
                     # Triplet loss
@@ -251,12 +264,15 @@ def vision_tuning_variable_dataset(lora_model,
         print(f"Avg loss at epoch {epoch} is {loss_by_epoch / num_batches}.")
         torch.cuda.empty_cache()
 
+    vision_model = vision_model.merge_and_unload()
+    base_model.vision_model = vision_model
     return base_model.eval()
 
 def test(model,
          dataset_name,
+         input_size,
          device):
-    validation_dataloader, num_query, _ = create_dataloader(dataset_name, INPUT_SIZE, "val", False)
+    validation_dataloader, num_query, _ = create_dataloader(dataset_name, input_size, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     for batch in validation_dataloader:
         with torch.no_grad():
@@ -264,7 +280,8 @@ def test(model,
             img = img.to(device)
             label = label.to(device)
             cam = cam.to(device)
-            test_feat = model.get_image_features(img)
+            test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)
+            test_feat = test_feat / test_feat.norm(p=2, dim=-1, keepdim=True)
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()
@@ -275,11 +292,14 @@ if __name__ == "__main__":
     input_sizes = [(256, 128), (224, 224)]
     class_names_list = ["person", "vehicle"]
     
-    lora_model, prompt_learners = LoRA_tuning_variable_dataset(dataset_names, input_sizes, class_names_list, DEVICE)
+    # Get the pre-tuned base model and prompt learners from locked image tuning
+    base_model, prompt_learners = LoRA_tuning_variable_dataset(dataset_names, input_sizes, class_names_list, DEVICE)
+
+    # Run LoRA vision tuning
+    model = LoRA_vision_tuning(base_model, prompt_learners, dataset_names, input_sizes, DEVICE)
     
-    model = vision_tuning_variable_dataset(lora_model, prompt_learners, dataset_names, input_sizes, DEVICE)
-    
-    for dataset_name in dataset_names:
-        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, DEVICE)
+    for i, dataset_name in enumerate(dataset_names):
+        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()
+

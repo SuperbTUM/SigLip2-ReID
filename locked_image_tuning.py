@@ -331,8 +331,10 @@ def LoRA_tuning_variable_dataset(dataset_names,
             loss_by_epoch += total_loss.item()
 
             print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
+    
+    base_model.text_model = lora_model.text_model.merge_and_unload()
 
-    return lora_model.eval(), prompt_learners
+    return base_model.eval(), prompt_learners
 
 def test(model,
          dataset_name,

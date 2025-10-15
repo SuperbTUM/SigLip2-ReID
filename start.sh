@@ -10,4 +10,4 @@ gdown 0B0o1ZxGs_oVZWmtFdXpqTGl3WUU
 unzip -q VeRi.zip
 wget https://raw.githubusercontent.com/Syliz517/CLIP-ReID/refs/heads/master/datasets/keypoint_train.txt
 wget https://raw.githubusercontent.com/Syliz517/CLIP-ReID/refs/heads/master/datasets/keypoint_test.txt
-python3 ./vision_tuning.py
+python3 ./LoRA_vision_tuning.py

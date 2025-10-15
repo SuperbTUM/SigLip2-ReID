@@ -53,7 +53,9 @@ class SiglipvisionConfig:
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
         self.num_image_tokens = num_image_tokens
-        self.version = version
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 class SiglipVisionEmbedding(nn.Module):
