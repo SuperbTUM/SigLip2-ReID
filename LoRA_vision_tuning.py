@@ -161,11 +161,6 @@ def LoRA_vision_tuning(base_model,
                                  dataset_names,
                                  input_sizes,
                                  device):
-    
-    # Freeze text model
-    for param in base_model.text_model.parameters():
-        param.requires_grad = False
-    base_model.text_model.eval()
 
     # PEFT LoRA configuration
     lora_config = LoraConfig(
@@ -179,9 +174,14 @@ def LoRA_vision_tuning(base_model,
     vision_model = get_peft_model(base_model.vision_model, lora_config)
     vision_model.print_trainable_parameters()
     
-    vision_model = vision_model.to(device)
+    vision_model = vision_model.to(device).train()
     text_model = base_model.text_model.to(device)
     embedding_dim = base_model.config.vision_config.hidden_size
+
+    # Freeze text model
+    for param in text_model.parameters():
+        param.requires_grad = False
+    text_model.eval()
 
     # --- Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
@@ -192,7 +192,7 @@ def LoRA_vision_tuning(base_model,
         train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
         
-        classifier = nn.Linear(embedding_dim, n_cls).to(device)
+        classifier = nn.Linear(embedding_dim, n_cls, bias=False, device=device)
         classifiers.append(classifier)
         all_trainable_params.extend(list(classifier.parameters()))
 
@@ -208,48 +208,46 @@ def LoRA_vision_tuning(base_model,
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
-        modified_text_embeddings.append(prompt_learner(text_model))
+        with torch.no_grad():
+            modified_text_embeddings.append(prompt_learner(text_model))
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 4  # Adjust as needed
     num_batches = max(len(loader) for loader in train_dataloaders)
+    dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
+    round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
     
-    optimizer.zero_grad()
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
-        
-        # Create cyclic iterators for each dataloader
-        dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
+        optimizer.zero_grad()
 
         for batch_idx in range(num_batches):
             total_loss = 0
+            i, dataloader_iter = next(round_robin_iter)
 
-            for i, dataloader_iter in enumerate(dataloader_iters):
-                image_tensor, label = next(dataloader_iter)[:2]
-                image_tensor = image_tensor.to(device)
-                label = label.to(device)
+            image_tensor, label = next(dataloader_iter)[:2]
+            image_tensor = image_tensor.to(device)
+            label = label.to(device)
 
-                with autocast(device):
-                    image_features = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
-                    
-                    # Cross-entropy loss
-                    logits = classifiers[i](image_features)
-                    loss_ce = criterion(logits, label)
-                    
-                    # Sigmoid loss
-                    with torch.no_grad():
-                        text_features = modified_text_embeddings[i][label]
-                    
-                    loss_sigmoid = sup_con_loss(image_features, text_features)
+            with autocast(device):
+                image_features = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
+                
+                # Cross-entropy loss
+                logits = classifiers[i](image_features)
+                loss_ce = criterion(logits, label)
+                
+                # Sigmoid loss
+                with torch.no_grad():
+                    text_features = modified_text_embeddings[i][label]
+                
+                loss_sigmoid = sup_con_loss(image_features, text_features)
 
-                    # Triplet loss
-                    loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
-                    total_loss += loss_triplet
-                    
-                    total_loss += loss_ce + loss_sigmoid
-            
-            # Normalize loss for accumulation
-            total_loss = total_loss / accumulation_steps
+                # Triplet loss
+                loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
+                total_loss += loss_triplet + loss_ce + loss_sigmoid
+
+                # Normalize loss for accumulation
+                total_loss = total_loss / accumulation_steps
             
             scaler.scale(total_loss).backward()
 

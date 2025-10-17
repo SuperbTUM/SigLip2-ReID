@@ -123,15 +123,15 @@ def vision_tuning_variable_dataset(lora_model,
                                  device):
     # --- Use the passed lora_model and prompt_learners ---
     base_model = lora_model
-    
-    # Freeze text model
-    for param in base_model.text_model.parameters():
-        param.requires_grad = False
-    base_model.text_model.eval()
 
-    vision_model = base_model.vision_model.to(device)
+    vision_model = base_model.vision_model.to(device).train()
     text_model = base_model.text_model.to(device)
     embedding_dim = base_model.config.vision_config.hidden_size
+
+    # Freeze text model
+    for param in text_model.parameters():
+        param.requires_grad = False
+    text_model.eval()
 
     # --- Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
@@ -142,7 +142,7 @@ def vision_tuning_variable_dataset(lora_model,
         train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
         
-        classifier = nn.Linear(embedding_dim, n_cls).to(device)
+        classifier = nn.Linear(embedding_dim, n_cls, bias=False, device=device)
         classifiers.append(classifier)
         all_trainable_params.extend(list(classifier.parameters()))
 
@@ -168,7 +168,7 @@ def vision_tuning_variable_dataset(lora_model,
             
             pos_features = features[is_pos]
             pos_dists = torch.cdist(anchor_feature.unsqueeze(0), pos_features)
-            hardest_pos_dist, hardest_pos_idx = torch.max(pos_dists, dim=1)
+            hardest_pos_dist, _ = torch.max(pos_dists, dim=1)
 
             # Find hardest negative
             is_neg = labels != anchor_label
@@ -177,7 +177,7 @@ def vision_tuning_variable_dataset(lora_model,
 
             neg_features = features[is_neg]
             neg_dists = torch.cdist(anchor_feature.unsqueeze(0), neg_features)
-            hardest_neg_dist, hardest_neg_idx = torch.min(neg_dists, dim=1)
+            hardest_neg_dist, _ = torch.min(neg_dists, dim=1)
             
             # Calculate triplet loss for this anchor
             triplet_loss = F.relu(hardest_pos_dist[0] - hardest_neg_dist[0] + margin)
@@ -196,47 +196,47 @@ def vision_tuning_variable_dataset(lora_model,
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
-        modified_text_embeddings.append(prompt_learner(text_model))
+        with torch.no_grad():
+            modified_text_embeddings.append(prompt_learner(text_model))
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 4  # Adjust as needed
     num_batches = max(len(loader) for loader in train_dataloaders)
+    dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
+
+    # Round-robin iterator that cycles through dataset indices
+    round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
     
-    optimizer.zero_grad()
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
+        optimizer.zero_grad()
         
-        # Create cyclic iterators for each dataloader
-        dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
-
         for batch_idx in range(num_batches):
+            i, dataloader_iter = next(round_robin_iter)
             total_loss = 0
 
-            for i, dataloader_iter in enumerate(dataloader_iters):
-                image_tensor, label = next(dataloader_iter)[:2]
-                image_tensor = image_tensor.to(device)
-                label = label.to(device)
+            image_tensor, label = next(dataloader_iter)[:2]
+            image_tensor = image_tensor.to(device)
+            label = label.to(device)
 
-                with autocast(device):
-                    image_features = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
-                    
-                    # Cross-entropy loss
-                    logits = classifiers[i](image_features)
-                    loss_ce = criterion(logits, label)
-                    
-                    # Sigmoid loss
-                    with torch.no_grad():
-                        text_features = modified_text_embeddings[i][label]
-                    loss_sigmoid = sup_con_loss(image_features, text_features)
+            with autocast(device):
+                image_features = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
+                
+                # Cross-entropy loss
+                logits = classifiers[i](image_features)
+                loss_ce = criterion(logits, label)
+                
+                # Sigmoid loss
+                with torch.no_grad():
+                    text_features = modified_text_embeddings[i][label]
+                loss_sigmoid = sup_con_loss(image_features, text_features)
 
-                    # Triplet loss
-                    loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
-                    total_loss += loss_triplet
-                    
-                    total_loss += loss_ce + loss_sigmoid
+                # Triplet loss
+                loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
+                total_loss += loss_triplet + loss_ce + loss_sigmoid
             
-            # Normalize loss for accumulation
-            total_loss = total_loss / accumulation_steps
+                # Normalize loss for accumulation
+                total_loss = total_loss / accumulation_steps
             
             scaler.scale(total_loss).backward()
 

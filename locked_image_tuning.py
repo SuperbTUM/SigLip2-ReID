@@ -294,35 +294,38 @@ def LoRA_tuning_variable_dataset(dataset_names,
             image_label_lists.append(torch.cat(image_label_list, dim=0))
 
     # --- Samplers for each dataset ---
-    pk_samplers = [PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // 16, 16) for labels in image_label_lists]
+    pk_samplers = [
+        PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // 16, 16)
+        for labels in image_label_lists
+    ]
     
     # --- Training Loop ---
     # Use itertools.cycle to handle datasets of different sizes
     num_batches = max(len(sampler) for sampler in pk_samplers)
-    
+    # Create cyclic iterators
+    sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
+
     for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
         
-        # Create cyclic iterators for each sampler
-        sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
-
-        for _ in range(num_batches):
+        for step, (i, sampler_iter) in enumerate(itertools.cycle(enumerate(sampler_iters))):
+            if step >= num_batches:  # stop after desired batches
+                break
             optimizer.zero_grad()
             total_loss = 0
 
-            for i, sampler_iter in enumerate(sampler_iters):
-                indices_batch, label_batch = next(sampler_iter)
-                
-                image_features_batch = image_features_lists[i][indices_batch]
-                label_batch = torch.tensor(label_batch, device=device)
+            indices_batch, label_batch = next(sampler_iter)
+            
+            image_features_batch = image_features_lists[i][indices_batch]
+            label_batch = torch.tensor(label_batch, device=device)
 
-                with autocast(device):
-                    modified_text_embeddings = prompt_learners[i](lora_model.text_model)
-                    text_features = modified_text_embeddings[label_batch]
-                    
-                    loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
-                           sup_con_loss(image_features_batch, text_features, label_batch)
-                    total_loss += loss
+            with autocast(device):
+                modified_text_embeddings = prompt_learners[i](lora_model.text_model)
+                text_features = modified_text_embeddings[label_batch]
+                
+                loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
+                        sup_con_loss(image_features_batch, text_features, label_batch)
+                total_loss += loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -330,7 +333,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
             scheduler.step()
             loss_by_epoch += total_loss.item()
 
-            print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
+        print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     
     base_model.text_model = lora_model.text_model.merge_and_unload()
 
