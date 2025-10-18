@@ -202,14 +202,15 @@ def vision_tuning_variable_dataset(lora_model,
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 4  # Adjust as needed
     num_batches = max(len(loader) for loader in train_dataloaders)
-    dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
-
-    # Round-robin iterator that cycles through dataset indices
-    round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
     
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
         optimizer.zero_grad()
+
+        dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
+
+        # Round-robin iterator that cycles through dataset indices
+        round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
         
         for batch_idx in range(num_batches):
             i, dataloader_iter = next(round_robin_iter)

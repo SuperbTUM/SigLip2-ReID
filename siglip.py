@@ -53,6 +53,7 @@ class SiglipvisionConfig:
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
         self.num_image_tokens = num_image_tokens
+        self.version = version
 
     def get(self, key, default=None):
         return getattr(self, key, default)
@@ -280,38 +281,22 @@ class SiglipAttention(nn.Module):
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # Calculate the attention using the formula Q * K^T / sqrt(d_k) . attn_weights : [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
-        attention_weights = (query_states @ key_states.transpose(2, 3) * self.scale)
 
-        if attention_weights.size() != (batch_size, self.num_heads, seq_len, seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(batch_size, self.num_heads, seq_len, seq_len)}, but is"
-                f"{attention_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            attention_weights = attention_weights + attention_mask
-
-        # Apply the softmax row-wise atten_weights: [Batch_Size, Num_Heads, Num_Patches, Num_Patches]
-        attention_weights = F.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # Apply dropout only during training
-        attention_weights = F.dropout(attention_weights, p=self.dropout, training=self.training)
         # Multiply the attention weights by the value_states. atten_output: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
-        attention_output = (attention_weights @ value_states)
-
-        if attention_weights.size() != (batch_size, self.num_heads, seq_len, seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(batch_size, self.num_heads, seq_len, seq_len)}, but is"
-                f" {attention_weights.size()}"
-            )
+        query_states, key_states, value_states = [x.contiguous() for x in (query_states, key_states, value_states)]
 
         # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim]
-        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False             # Vision Transformer attention is not causal
+        )
         # [Batch_Size, Num_Patches, Num_Heads, Head_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         attention_output = attention_output.reshape(batch_size, seq_len, self.embed_dim)
         # [Batch_Size, Num_Patches, Embed_Dim]
         attention_output = self.out_proj(attention_output)
-        return attention_output, attention_weights
+        return attention_output
 
 
 class Siglip2MLP(nn.Module):
@@ -350,7 +335,7 @@ class SiglipEncoderLayer(nn.Module):
         # [Batch_Size, Num_patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.layer_norm1(hidden_states)
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states, _ = self.self_attn(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states = self.self_attn(hidden_states=hidden_states, attention_mask=attention_mask)
         # [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = residual + hidden_states
         # residual : [Batch_Size, Num_Patches, Embed_Dim]

@@ -6,6 +6,7 @@ from evaluation import R1_mAP_eval_pt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torch.amp import autocast, GradScaler
 from typing import List, Optional
 import itertools
@@ -120,41 +121,23 @@ class PromptLearner(nn.Module):
 
 def mine_hard_triplets(features, labels, margin=0.3):
     device = features.device
-    loss = torch.tensor(0.0, device=device)
-    num_triplets = 0
 
-    for i in range(len(labels)):
-        anchor_feature = features[i]
-        anchor_label = labels[i]
+    # Compute full pairwise distance matrix
+    dist_matrix = torch.cdist(features, features, p=2)
 
-        # Find hardest positive
-        is_pos = (labels == anchor_label) & (torch.arange(len(labels), device=device) != i)
-        if not torch.any(is_pos):
-            continue
-        
-        pos_features = features[is_pos]
-        pos_dists = torch.cdist(anchor_feature.unsqueeze(0), pos_features)
-        hardest_pos_dist, hardest_pos_idx = torch.max(pos_dists, dim=1)
+    # For each anchor, mask positives/negatives
+    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+    labels_neq = ~labels_eq
 
-        # Find hardest negative
-        is_neg = labels != anchor_label
-        if not torch.any(is_neg):
-            continue
+    hardest_pos_dist = (dist_matrix * labels_eq.float()).max(dim=1)[0]
+    # replace zeros (self-distances) with -inf to exclude self
+    hardest_pos_dist[hardest_pos_dist == 0] = 0
 
-        neg_features = features[is_neg]
-        neg_dists = torch.cdist(anchor_feature.unsqueeze(0), neg_features)
-        hardest_neg_dist, hardest_neg_idx = torch.min(neg_dists, dim=1)
-        
-        # Calculate triplet loss for this anchor
-        triplet_loss = F.relu(hardest_pos_dist[0] - hardest_neg_dist[0] + margin)
-        loss += triplet_loss
-        num_triplets += 1
-        
-    
-    if num_triplets == 0:
-        return torch.tensor(0.0, device=device)
+    hardest_neg_dist = (dist_matrix + 1e5 * labels_eq.float()).min(dim=1)[0]
 
-    return loss / num_triplets
+    triplet_loss = F.relu(hardest_pos_dist - hardest_neg_dist + margin)
+    return triplet_loss.mean()
+
 
 def LoRA_vision_tuning(base_model,
                                  prompt_learners,
@@ -171,10 +154,11 @@ def LoRA_vision_tuning(base_model,
         bias="none",
     )
 
+    base_model.vision_model = base_model.vision_model.train()
     vision_model = get_peft_model(base_model.vision_model, lora_config)
     vision_model.print_trainable_parameters()
     
-    vision_model = vision_model.to(device).train()
+    vision_model = vision_model.to(device)
     text_model = base_model.text_model.to(device)
     embedding_dim = base_model.config.vision_config.hidden_size
 
@@ -196,7 +180,7 @@ def LoRA_vision_tuning(base_model,
         classifiers.append(classifier)
         all_trainable_params.extend(list(classifier.parameters()))
 
-    optimizer = torch.optim.Adam(all_trainable_params, lr=5e-6, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(all_trainable_params, lr=5e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
     sup_con_loss = SupervisedSigmoidLoss().to(device)
@@ -212,14 +196,18 @@ def LoRA_vision_tuning(base_model,
             modified_text_embeddings.append(prompt_learner(text_model))
 
     # --- Training Loop (with Gradient Accumulation) ---
-    accumulation_steps = 4  # Adjust as needed
+    accumulation_steps = 2  # Adjust as needed
     num_batches = max(len(loader) for loader in train_dataloaders)
-    dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
-    round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
+
+    def fwd(x):
+        return vision_model(pixel_values=x, interpolate_pos_encoding=False)
     
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
         optimizer.zero_grad()
+
+        dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
+        round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
 
         for batch_idx in range(num_batches):
             total_loss = 0
@@ -229,8 +217,8 @@ def LoRA_vision_tuning(base_model,
             image_tensor = image_tensor.to(device)
             label = label.to(device)
 
-            with autocast(device):
-                image_features = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
+            with autocast(device, torch.float16):
+                image_features = checkpoint(fwd, image_tensor, use_reentrant=False)
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
@@ -246,8 +234,8 @@ def LoRA_vision_tuning(base_model,
                 loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
                 total_loss += loss_triplet + loss_ce + loss_sigmoid
 
-                # Normalize loss for accumulation
-                total_loss = total_loss / accumulation_steps
+            # Normalize loss for accumulation
+            total_loss = total_loss / accumulation_steps
             
             scaler.scale(total_loss).backward()
 
@@ -255,6 +243,8 @@ def LoRA_vision_tuning(base_model,
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             
             loss_by_epoch += total_loss.item() * accumulation_steps
 
