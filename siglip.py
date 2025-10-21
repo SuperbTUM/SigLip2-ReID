@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-
 
 def _prepare_4d_attention_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -19,7 +17,24 @@ def _prepare_4d_attention_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: 
         tgt_len (`int`):
             The target length or query length the created mask shall have.
     """
-    return AttentionMaskConverter._expand_mask(mask=mask, dtype=dtype, tgt_len=tgt_len)
+    if mask is None:
+        return None
+
+    # mask expected shape: (batch, src_len)
+    if mask.dim() != 2:
+        raise ValueError(f"Expected 2D attention mask, got shape {mask.shape}")
+
+    batch, src_len = mask.shape
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    # Convert to bool and create a view with shape (batch, 1, 1, src_len) and then expand to (batch,1,tgt_len,src_len)
+    # Using view/expand avoids allocating a new tensor for each expanded mask.
+    bool_mask = mask.to(torch.bool)
+    bool_mask = bool_mask[:, None, None, :]  # (batch, 1, 1, src_len)
+    if tgt_len == src_len:
+        return bool_mask.expand(batch, 1, tgt_len, src_len)
+    else:
+        return bool_mask.expand(batch, 1, tgt_len, src_len)
 
 
 class SiglipvisionConfig:
@@ -283,7 +298,7 @@ class SiglipAttention(nn.Module):
         value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         # Multiply the attention weights by the value_states. atten_output: [Batch_Size, Num_Heads, Num_Patches, Head_Dim]
-        query_states, key_states, value_states = [x.contiguous() for x in (query_states, key_states, value_states)]
+        query_states, key_states, value_states = [x if x.is_contiguous() else x.contiguous() for x in (query_states, key_states, value_states)]
 
         # [Batch_Size, Num_Heads, Num_Patches, Head_Dim] -> [Batch_Size, Num_Patches, Num_Heads, Head_Dim]
         attention_output = F.scaled_dot_product_attention(
@@ -446,7 +461,7 @@ class SiglipVisionTransformer(nn.Module):
         else:
             pixel_values, attention_mask = self.pad_along_first_dim(self.convert_image_to_patches(pixel_values, self.config.patch_size), self.config.num_patches)
             hidden_states = self.embeddings(pixel_values, spatial_shapes)
-            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
+            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype, hidden_states.shape[1])
 
         last_hidden_state = self.encoder(inputs_embeds=hidden_states, attention_mask=attention_mask)
 
@@ -632,7 +647,7 @@ class Siglip2TextTransformer(nn.Module):
         # expand attention_mask
         if attention_mask is not None and not self._use_flash_attention_2:
             # [batch_size, seq_len] -> [batch_size, 1, tgt_seq_len, src_seq_len]
-            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
+            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype, hidden_states.shape[1])
 
         last_hidden_state = self.encoder(
             inputs_embeds=hidden_states,
