@@ -11,7 +11,7 @@ from torch.amp import autocast, GradScaler
 from typing import List, Optional
 import itertools
 
-from peft import get_peft_model, LoraConfig
+from peft import get_peft_model, AdaLoraConfig
 from locked_image_tuning import LoRA_tuning_variable_dataset
 
 import os
@@ -119,24 +119,39 @@ class PromptLearner(nn.Module):
         return prompted_text_features
 
 
-def mine_hard_triplets(features, labels, margin=0.3):
-    device = features.device
-
-    # Compute full pairwise distance matrix
+def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, reg_weight=0.1):
+    """
+    Hard triplet mining with flexible, regularized adaptive margin.
+    
+    Args:
+        features: [B, D] tensor of embeddings.
+        labels: [B] tensor of class indices.
+        base_margin: base margin value (float).
+        adaptive_weight: how strongly the margin adapts per sample.
+        reg_weight: regularization weight pulling adaptive margin back to base_margin.
+    """
     dist_matrix = torch.cdist(features, features, p=2)
 
-    # For each anchor, mask positives/negatives
     labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
-    labels_neq = ~labels_eq
 
+    # Hardest positive and negative distances
     hardest_pos_dist = (dist_matrix * labels_eq.float()).max(dim=1)[0]
-    # replace zeros (self-distances) with -inf to exclude self
-    hardest_pos_dist[hardest_pos_dist == 0] = 0
-
     hardest_neg_dist = (dist_matrix + 1e5 * labels_eq.float()).min(dim=1)[0]
 
-    triplet_loss = F.relu(hardest_pos_dist - hardest_neg_dist + margin)
-    return triplet_loss.mean()
+    # --- Adaptive margin component ---
+    # Example: use distance spread (neg - pos) as confidence
+    dist_diff = (hardest_neg_dist - hardest_pos_dist).detach()
+    adaptive_margin = base_margin + adaptive_weight * (0.3 - torch.tanh(dist_diff))
+    # Smooth clamp to avoid exploding margin
+    adaptive_margin = torch.clamp(adaptive_margin, 0.05, 0.6)
+
+    # --- Triplet loss with adaptive margin ---
+    triplet_loss = F.relu(hardest_pos_dist - hardest_neg_dist + adaptive_margin)
+    
+    # --- Regularization to keep margins near base ---
+    reg_loss = reg_weight * (adaptive_margin - base_margin).abs().mean()
+
+    return triplet_loss.mean() + reg_loss
 
 
 def LoRA_vision_tuning(base_model,
@@ -145,42 +160,66 @@ def LoRA_vision_tuning(base_model,
                                  input_sizes,
                                  device):
 
-    # PEFT LoRA configuration
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.1,
-        bias="none",
-    )
-
-    base_model.vision_model = base_model.vision_model.train()
-    vision_model = get_peft_model(base_model.vision_model, lora_config)
-    vision_model.print_trainable_parameters()
-    
-    vision_model = vision_model.to(device)
-    text_model = base_model.text_model.to(device)
-    embedding_dim = base_model.config.vision_config.hidden_size
-
-    # Freeze text model
-    for param in text_model.parameters():
-        param.requires_grad = False
-    text_model.eval()
-
-    # --- Dataloaders and Classifiers for each dataset ---
+    # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
     classifiers = []
-    all_trainable_params = list(vision_model.parameters())
+    classifier_params = [] # <-- Store classifier params here first
+    embedding_dim = base_model.config.vision_config.hidden_size
 
     for dataset_name, input_size in zip(dataset_names, input_sizes):
         train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
         
-        classifier = nn.Linear(embedding_dim, n_cls, bias=False, device=device)
+        # Create classifier and move to device
+        # Classifier: BatchNorm + FC
+        classifier = nn.Sequential(
+            nn.BatchNorm1d(embedding_dim),
+            nn.Linear(embedding_dim, n_cls, bias=False),
+            
+        ).to(device)
         classifiers.append(classifier)
-        all_trainable_params.extend(list(classifier.parameters()))
+        
+        # Add its parameters to the list
+        classifier_params.extend(list(classifier.parameters()))
 
-    optimizer = torch.optim.Adam(all_trainable_params, lr=5e-4, weight_decay=1e-4)
+    num_batches = max(len(loader) for loader in train_dataloaders)
+
+    # --- 2. Freeze Text Model ---
+    # (Do this early, it doesn't affect the optimizer)
+    text_model = base_model.text_model.to(device)
+    for param in text_model.parameters():
+        param.requires_grad = False
+    text_model.eval()
+    text_model = text_model.to(device)
+
+    # --- 3. Apply PEFT to the Vision Model ---
+    base_model.vision_model = base_model.vision_model.train()
+    lora_config = AdaLoraConfig(
+        r=8,
+        init_r=12,
+        tinit=num_batches * 5,
+        tfinal=num_batches * 50,
+        deltaT=num_batches,
+        target_modules=["q_proj", "v_proj"],
+        bias="none",
+        total_step=num_batches * N_EPOCHS_VISION,
+    )
+    # This creates the *new* trainable LoRA parameters
+    base_model.vision_model = base_model.vision_model.train()
+    vision_model = get_peft_model(base_model.vision_model, lora_config)
+    vision_model.print_trainable_parameters()
+    vision_model = vision_model.to(device)
+
+    # --- 4. NOW Create the Optimizer ---
+    # vision_model.parameters() will *only* return the trainable LoRA parameters
+
+    optimizer = torch.optim.Adam(
+        [
+            {'params': vision_model.parameters(), 'lr': 5e-3, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': classifier_params, 'lr': 0.01, 'weight_decay': 1e-4}    # Group 2: Classifier params
+        ])
+
+    # --- 5. Schedulers and Losses ---
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
     sup_con_loss = SupervisedSigmoidLoss().to(device)
@@ -197,7 +236,6 @@ def LoRA_vision_tuning(base_model,
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
-    num_batches = max(len(loader) for loader in train_dataloaders)
 
     def fwd(x):
         return vision_model(pixel_values=x, interpolate_pos_encoding=False)
@@ -228,10 +266,10 @@ def LoRA_vision_tuning(base_model,
                 with torch.no_grad():
                     text_features = modified_text_embeddings[i][label]
                 
-                loss_sigmoid = sup_con_loss(image_features, text_features)
+                loss_sigmoid = sup_con_loss(image_features, text_features, label)
 
                 # Triplet loss
-                loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
+                loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3)
                 total_loss += loss_triplet + loss_ce + loss_sigmoid
 
             # Normalize loss for accumulation
@@ -243,8 +281,6 @@ def LoRA_vision_tuning(base_model,
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
             
             loss_by_epoch += total_loss.item() * accumulation_steps
 

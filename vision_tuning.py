@@ -142,7 +142,11 @@ def vision_tuning_variable_dataset(lora_model,
         train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
         
-        classifier = nn.Linear(embedding_dim, n_cls, bias=False, device=device)
+        classifier = nn.Sequential(
+            nn.BatchNorm1d(embedding_dim),
+            nn.Linear(embedding_dim, n_cls, bias=False),
+            
+        ).to(device)
         classifiers.append(classifier)
         all_trainable_params.extend(list(classifier.parameters()))
 
@@ -230,7 +234,7 @@ def vision_tuning_variable_dataset(lora_model,
                 # Sigmoid loss
                 with torch.no_grad():
                     text_features = modified_text_embeddings[i][label]
-                loss_sigmoid = sup_con_loss(image_features, text_features)
+                loss_sigmoid = sup_con_loss(image_features, text_features, label)
 
                 # Triplet loss
                 loss_triplet = mine_hard_triplets(image_features, label, margin=0.3)
