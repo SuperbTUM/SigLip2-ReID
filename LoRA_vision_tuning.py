@@ -11,7 +11,7 @@ from torch.amp import autocast, GradScaler
 from typing import List, Optional
 import itertools
 
-from peft import get_peft_model, AdaLoraConfig
+from peft import get_peft_model, AdaLoraConfig, LoraConfig
 from locked_image_tuning import LoRA_tuning_variable_dataset
 
 import os
@@ -154,11 +154,14 @@ def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, r
     return triplet_loss.mean() + reg_loss
 
 
-def LoRA_vision_tuning(base_model,
-                                 prompt_learners,
-                                 dataset_names,
-                                 input_sizes,
-                                 device):
+def LoRA_vision_tuning(
+        base_model,
+        prompt_learners,
+        dataset_names,
+        input_sizes,
+        device,
+        adalora=False
+):
 
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
@@ -194,16 +197,25 @@ def LoRA_vision_tuning(base_model,
 
     # --- 3. Apply PEFT to the Vision Model ---
     base_model.vision_model = base_model.vision_model.train()
-    lora_config = AdaLoraConfig(
-        r=8,
-        init_r=12,
-        tinit=num_batches * 5,
-        tfinal=num_batches * 50,
-        deltaT=num_batches,
-        target_modules=["q_proj", "v_proj"],
-        bias="none",
-        total_step=num_batches * N_EPOCHS_VISION,
-    )
+    if adalora:
+        lora_config = AdaLoraConfig(
+            r=8,
+            init_r=12,
+            tinit=num_batches * 5,
+            tfinal=num_batches * 50,
+            deltaT=num_batches,
+            target_modules=["q_proj", "v_proj"],
+            bias="none",
+            total_step=num_batches * N_EPOCHS_VISION,
+        )
+    else:
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.1,
+            use_dora=True
+        )
     # This creates the *new* trainable LoRA parameters
     base_model.vision_model = base_model.vision_model.train()
     vision_model = get_peft_model(base_model.vision_model, lora_config)

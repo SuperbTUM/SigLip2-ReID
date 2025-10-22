@@ -200,7 +200,7 @@ def LoRA_tuning(dataset_name,
     
     image_features_list = torch.cat(image_features_list, dim=0).to(device)
     image_label_list = torch.cat(image_label_list, dim=0)
-    pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), BATCH_SIZE // 16, 16)
+    pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
 
     for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
@@ -245,6 +245,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
         lora_alpha=16,
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.1,
+        use_dora=True
     )
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
     lora_model = base_model.to(device)
@@ -295,7 +296,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
 
     # --- Samplers for each dataset ---
     pk_samplers = [
-        PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // 16, 16)
+        PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
         for labels in image_label_lists
     ]
     

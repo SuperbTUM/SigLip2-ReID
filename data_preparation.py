@@ -155,6 +155,6 @@ def create_dataloader(dataset_name, input_size, type, augmented):
     dataloader = DataLoader(preprocessed_dataset, 
                             batch_size=BATCH_SIZE, 
                             shuffle=not augmented, 
-                            sampler=RandomIdentitySampler(dataset.train, BATCH_SIZE, 16) if augmented else None,
+                            sampler=RandomIdentitySampler(dataset.train, BATCH_SIZE, N_INSTANCE) if augmented else None,
                             num_workers=N_WORKER)
     return dataloader, None if type == "train" else len(dataset.query), dataset.num_train_pids if type == "train" else None
