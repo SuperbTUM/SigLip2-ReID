@@ -50,7 +50,7 @@ class SupervisedSigmoidLoss(nn.Module):
     """
     def __init__(self, temperature: float = 10.0, reduction: str = 'mean'):
         super().__init__()
-        self.temperature = nn.Parameter(torch.tensor(temperature))
+        self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
         self.reduction = reduction
 
     def forward(self, 
@@ -70,8 +70,8 @@ class SupervisedSigmoidLoss(nn.Module):
         Returns:
             torch.Tensor: The computed loss value.
         """
-
-        logits = torch.matmul(image_features, text_features.t()) * self.temperature
+        temperature = self.temperature.exp().clamp(1, 100)
+        logits = torch.matmul(image_features, text_features.t()) * temperature
 
         if class_labels is None:
             # Standard instance-level matching (image_i matches text_i)
@@ -272,12 +272,14 @@ def LoRA_tuning_variable_dataset(dataset_names,
         prompt_learners.append(prompt_learner)
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
-    optimizer = torch.optim.Adam(all_trainable_params, lr=3.5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
     sup_con_loss = SupervisedSigmoidLoss().to(device)
     scaler = GradScaler(device)
+    optimizer = torch.optim.Adam(
+        all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, N_EPOCHS_LoRA // 2, eta_min=1e-6)
 
     # --- Pre-extract image features for all datasets ---
+    # @torch.inference_mode()
     image_features_lists = []
     image_label_lists = []
     with torch.no_grad():
@@ -331,8 +333,8 @@ def LoRA_tuning_variable_dataset(dataset_names,
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             loss_by_epoch += total_loss.item()
+        scheduler.step()
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     

@@ -28,7 +28,7 @@ class SupervisedSigmoidLoss(nn.Module):
     """
     def __init__(self, temperature: float = 10.0, reduction: str = 'mean'):
         super().__init__()
-        self.temperature = nn.Parameter(torch.tensor(temperature))
+        self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
         self.reduction = reduction
 
     def forward(self,
@@ -48,8 +48,8 @@ class SupervisedSigmoidLoss(nn.Module):
         Returns:
             torch.Tensor: The computed loss value.
         """
-
-        logits = torch.matmul(image_features, text_features.t()) * self.temperature
+        temperature = self.temperature.exp().clamp(1, 100)
+        logits = torch.matmul(image_features, text_features.t()) * temperature
 
         if class_labels is None:
             # Standard instance-level matching (image_i matches text_i)
@@ -224,18 +224,17 @@ def LoRA_vision_tuning(
 
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
-
+    sup_con_loss = SupervisedSigmoidLoss().to(device)
+    scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         [
-            {'params': vision_model.parameters(), 'lr': 5e-3, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-3, 'weight_decay': 1e-4},           # Group 1: LoRA params
             {'params': classifier_params, 'lr': 0.01, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
     # --- 5. Schedulers and Losses ---
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
-    sup_con_loss = SupervisedSigmoidLoss().to(device)
-    scaler = GradScaler(device)
 
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
