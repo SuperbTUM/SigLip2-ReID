@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from torch.amp import autocast, GradScaler
 from typing import List, Optional
 import itertools
+from functools import partial
 
 from peft import get_peft_model, AdaLoraConfig, LoraConfig
 from locked_image_tuning import LoRA_tuning_variable_dataset
@@ -229,11 +230,27 @@ def LoRA_vision_tuning(
     optimizer = torch.optim.Adam(
         [
             {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-3, 'weight_decay': 1e-4},           # Group 1: LoRA params
-            {'params': classifier_params, 'lr': 0.01, 'weight_decay': 1e-4}    # Group 2: Classifier params
+            {'params': classifier_params, 'lr': 5e-3, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
     # --- 5. Schedulers and Losses ---
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
+    def warmup_lambda(epoch, warmup_epochs, start_lr, base_lr):
+        if epoch >= warmup_epochs:
+            return 1.0  # after warmup, multiplier = 1
+        else:
+            # linear from start_lr -> base_lr
+            # since optimizer.lr is already base_lr, scale relative to that
+            lr_factor = start_lr / base_lr + (1 - start_lr / base_lr) * (epoch / warmup_epochs)
+            return lr_factor
+
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-4, base_lr=5e-3))
+    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, multistep_scheduler],
+        milestones=[5]
+    )
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
 
     # --- Freeze prompt learners ---
@@ -316,7 +333,6 @@ def test(model,
             label = label.to(device)
             cam = cam.to(device)
             test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)
-            test_feat = test_feat / test_feat.norm(p=2, dim=-1, keepdim=True)
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()
