@@ -263,8 +263,8 @@ def test(model,
          device):
     validation_dataloader, num_query, _ = create_dataloader(dataset_name, INPUT_SIZE, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
-    for batch in validation_dataloader:
-        with torch.no_grad():
+    with torch.inference_mode():
+        for batch in validation_dataloader:
             img, label, cam = batch[:3]
             img = img.to(device)
             label = label.to(device)

@@ -189,7 +189,7 @@ def LoRA_tuning(dataset_name,
     lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss = tuning_preparation(class_names, device)
     image_features_list = []
     image_label_list = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in train_dataloader:
             image_tensor, label = batch[:2]
             image_tensor = image_tensor.to(device)
@@ -275,14 +275,13 @@ def LoRA_tuning_variable_dataset(dataset_names,
     sup_con_loss = SupervisedSigmoidLoss().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
-        all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-4, weight_decay=1e-4)
+        all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, N_EPOCHS_LoRA // 2, eta_min=1e-6)
 
     # --- Pre-extract image features for all datasets ---
-    # @torch.inference_mode()
     image_features_lists = []
     image_label_lists = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for i, train_dataloader in enumerate(train_dataloaders):
             image_features_list = []
             image_label_list = []
@@ -347,8 +346,8 @@ def test(model,
          device):
     validation_dataloader, num_query, _ = create_dataloader(dataset_name, INPUT_SIZE, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
-    for batch in validation_dataloader:
-        with torch.no_grad():
+    with torch.inference_mode():
+        for batch in validation_dataloader:
             img, label, cam = batch[:3]
             img = img.to(device)
             label = label.to(device)

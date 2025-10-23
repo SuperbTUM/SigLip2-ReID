@@ -48,6 +48,7 @@ class VeRi(BaseImageDataset):
             viewid = int(content[-1])
             self.image_map_view_test[osp.basename(content[0])] = viewid
 
+        self.verbose = verbose
         train = self._process_dir(self.train_dir, relabel=True)
         query = self._process_dir(self.query_dir, relabel=False)
         gallery = self._process_dir(self.gallery_dir, relabel=False)
@@ -111,6 +112,7 @@ class VeRi(BaseImageDataset):
                 viewid = self.image_map_view_train[osp.basename(img_path)]
             view_container.add(viewid)
             dataset.append((img_path, pid, camid, viewid))
-        print(view_container, 'view_container')
-        print(count, 'samples without viewpoint annotations')
+        if self.verbose:
+            print(view_container, 'view_container')
+            print(count, 'samples without viewpoint annotations')
         return dataset
