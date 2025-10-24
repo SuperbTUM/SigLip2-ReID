@@ -287,7 +287,7 @@ def LoRA_vision_tuning(
             label = label.to(device)
 
             with autocast(device, torch.float16):
-                image_features = checkpoint(fwd, image_tensor, use_reentrant=False)
+                image_features, last_hidden_state = checkpoint(fwd, image_tensor, use_reentrant=False)
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
@@ -297,10 +297,12 @@ def LoRA_vision_tuning(
                 with torch.no_grad():
                     text_features = modified_text_embeddings[i][label]
                 
-                loss_sigmoid = sup_con_loss(image_features, text_features, label)
+                loss_sigmoid = sup_con_loss(image_features, text_features, label) + \
+                               sup_con_loss(text_features, image_features, label)
 
                 # Triplet loss
-                loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3)
+                loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \
+                                mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
                 total_loss += loss_triplet + loss_ce + loss_sigmoid
 
             # Normalize loss for accumulation
@@ -335,7 +337,7 @@ def test(model,
             img = img.to(device)
             label = label.to(device)
             cam = cam.to(device)
-            test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)
+            test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)[0]
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()

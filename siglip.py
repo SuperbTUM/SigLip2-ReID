@@ -469,7 +469,7 @@ class SiglipVisionTransformer(nn.Module):
 
         pooler_output = self.head(last_hidden_state)
 
-        return pooler_output
+        return pooler_output, last_hidden_state[:, 1:, :].mean(dim=1)
 
 
 class SiglipVisionModel(nn.Module):
@@ -794,12 +794,12 @@ class SiglipModel(nn.Module):
         ```"""
         # Use SiglipModel's config for some fields (if specified) instead of those of vision & text components.
 
-        pooled_output = self.vision_model(
+        pooled_output, last_hidden_state = self.vision_model(
             pixel_values=pixel_values,
             interpolate_pos_encoding=interpolate_pos_encoding,
         )
 
-        return pooled_output
+        return pooled_output, last_hidden_state
 
     def forward(
             self,

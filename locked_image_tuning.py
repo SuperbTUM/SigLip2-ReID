@@ -194,11 +194,11 @@ def LoRA_tuning(dataset_name,
             image_tensor, label = batch[:2]
             image_tensor = image_tensor.to(device)
             label = label.to(device)
-            image_features = lora_model.get_image_features(image_tensor)
+            image_features = lora_model.get_image_features(image_tensor)[0]
             image_features_list.append(image_features)
             image_label_list.append(label)
     
-    image_features_list = torch.cat(image_features_list, dim=0).to(device)
+    image_features_list = torch.cat(image_features_list, dim=0)
     image_label_list = torch.cat(image_label_list, dim=0)
     pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
 
@@ -289,7 +289,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
                 image_tensor, label = batch[:2]
                 image_tensor = image_tensor.to(device)
                 label = label.to(device)
-                image_features = lora_model.get_image_features(image_tensor)
+                image_features = lora_model.get_image_features(image_tensor)[0]
                 image_features_list.append(image_features)
                 image_label_list.append(label)
             image_features_lists.append(torch.cat(image_features_list, dim=0).to(device))
@@ -352,7 +352,7 @@ def test(model,
             img = img.to(device)
             label = label.to(device)
             cam = cam.to(device)
-            test_feat = model.get_image_features(img)
+            test_feat = model.get_image_features(img)[0]
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     return cmc[0], cmc[4], cmc[9], mAP
