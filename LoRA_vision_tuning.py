@@ -30,15 +30,15 @@ class SupervisedSigmoidLoss(nn.Module):
     2.  Supervised-level: If class_labels are provided, it treats all samples
         with the same label as positive pairs.
     """
-    def __init__(self, temperature: float = 10.0, reduction: str = 'mean'):
+    def __init__(self, temperature: float = 1.0, reduction: str = 'mean'):
         super().__init__()
         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
         self.reduction = reduction
 
-    def forward(self,
-              image_features: torch.Tensor,
+    def forward(self, 
+              image_features: torch.Tensor, 
               text_features: torch.Tensor,
-              class_labels: Optional[torch.Tensor] = None):
+              class_labels: Optional[torch.Tensor]):
         """
         Computes the Supervised Sigmoid Loss.
 
@@ -52,30 +52,12 @@ class SupervisedSigmoidLoss(nn.Module):
         Returns:
             torch.Tensor: The computed loss value.
         """
-        temperature = self.temperature.exp().clamp(1, 100)
+        temperature = self.temperature.exp().clamp(0.1, 10.0)
         logits = torch.matmul(image_features, text_features.t()) * temperature
 
-        if class_labels is None:
-            # Standard instance-level matching (image_i matches text_i)
-            labels = torch.eye(logits.shape[0], device=logits.device)
-        else:
-            # Supervised matching: pairs with the same class label are positives.
-            # Use broadcasting to create a matrix of label equality.
-            # Shape: (N, N)
-            labels = (class_labels.unsqueeze(0) == class_labels.unsqueeze(1)).float()
+        labels = torch.arange(logits.shape[0], device=logits.device)
 
-        # We must ignore the loss for an item matched with itself if it's not
-        # the designated text pair in the instance-level case. In the supervised
-        # case, an item is always positive with itself.
-        # For simplicity here, we assume the main diagonal should always be positive.
-        if class_labels is not None:
-             labels.fill_diagonal_(1)
-
-        loss = F.binary_cross_entropy_with_logits(
-            logits,
-            labels,
-            reduction=self.reduction
-        )
+        loss = F.cross_entropy(logits, labels)
 
         return loss
 
@@ -161,6 +143,7 @@ def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, r
 def LoRA_vision_tuning(
         base_model,
         prompt_learners,
+        temperature,
         dataset_names,
         input_sizes,
         device,
@@ -228,7 +211,7 @@ def LoRA_vision_tuning(
 
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
-    sup_con_loss = SupervisedSigmoidLoss().to(device)
+    sup_con_loss = SupervisedSigmoidLoss(temperature).to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         [
@@ -349,10 +332,10 @@ if __name__ == "__main__":
     class_names_list = ["person", "vehicle"]
     
     # Get the pre-tuned base model and prompt learners from locked image tuning
-    base_model, prompt_learners = LoRA_tuning_variable_dataset(dataset_names, input_sizes, class_names_list, DEVICE)
+    base_model, prompt_learners, temperature = LoRA_tuning_variable_dataset(dataset_names, input_sizes, class_names_list, DEVICE)
 
     # Run LoRA vision tuning
-    model = LoRA_vision_tuning(base_model, prompt_learners, dataset_names, input_sizes, DEVICE)
+    model = LoRA_vision_tuning(base_model, prompt_learners, temperature, dataset_names, input_sizes, DEVICE)
     
     for i, dataset_name in enumerate(dataset_names):
         cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE)

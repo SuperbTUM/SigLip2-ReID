@@ -48,7 +48,7 @@ class SupervisedSigmoidLoss(nn.Module):
     2.  Supervised-level: If class_labels are provided, it treats all samples
         with the same label as positive pairs.
     """
-    def __init__(self, temperature: float = 10.0, reduction: str = 'mean'):
+    def __init__(self, temperature: float = 1.0, reduction: str = 'mean'):
         super().__init__()
         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
         self.reduction = reduction
@@ -56,7 +56,7 @@ class SupervisedSigmoidLoss(nn.Module):
     def forward(self, 
               image_features: torch.Tensor, 
               text_features: torch.Tensor,
-              class_labels: Optional[torch.Tensor] = None):
+              class_labels: Optional[torch.Tensor]):
         """
         Computes the Supervised Sigmoid Loss.
 
@@ -70,31 +70,12 @@ class SupervisedSigmoidLoss(nn.Module):
         Returns:
             torch.Tensor: The computed loss value.
         """
-        temperature = self.temperature.exp().clamp(1, 100)
+        temperature = self.temperature.exp().clamp(0.1, 10.0)
         logits = torch.matmul(image_features, text_features.t()) * temperature
 
-        if class_labels is None:
-            # Standard instance-level matching (image_i matches text_i)
-            labels = torch.eye(logits.shape[0], device=logits.device)
-        else:
-            # Supervised matching: pairs with the same class label are positives.
-            # Use broadcasting to create a matrix of label equality.
-            # Shape: (N, N)
-            labels = (class_labels.unsqueeze(0) == class_labels.unsqueeze(1)).float()
+        labels = torch.arange(logits.shape[0], device=logits.device)
 
-        # We must ignore the loss for an item matched with itself if it's not
-        # the designated text pair in the instance-level case. In the supervised
-        # case, an item is always positive with itself.
-        # For simplicity here, we assume the main diagonal should always be positive.
-        if class_labels is not None:
-             labels.fill_diagonal_(1)
-
-
-        loss = F.binary_cross_entropy_with_logits(
-            logits,
-            labels,
-            reduction=self.reduction
-        )
+        loss = F.cross_entropy(logits, labels)
 
         return loss
     
@@ -276,7 +257,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, N_EPOCHS_LoRA // 2, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
 
     # --- Pre-extract image features for all datasets ---
     image_features_lists = []
@@ -339,7 +320,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
     
     base_model.text_model = lora_model.text_model.merge_and_unload()
 
-    return base_model.eval(), prompt_learners
+    return base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item()
 
 def test(model,
          dataset_name,
