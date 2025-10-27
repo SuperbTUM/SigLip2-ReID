@@ -61,49 +61,6 @@ class SupervisedSigmoidLoss(nn.Module):
 
         return loss
 
-class PromptLearner(nn.Module):
-    def __init__(self,
-                 text_tokenizer,
-                 num_prompt_tokens,
-                 embedding_dim,
-                 class_names: List[str]):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_prompt_tokens = num_prompt_tokens
-
-        # Initialize the learnable prompt vectors
-        prompt_vectors = torch.empty(len(class_names), num_prompt_tokens, embedding_dim)
-        nn.init.normal_(prompt_vectors, std=0.02) # Standard initialization
-        self.prompt = nn.Parameter(prompt_vectors)
-
-        # Store tokenized class names
-        self.class_names = class_names
-        # Note: In a full implementation, you'd handle tokenization carefully here.
-        text_inputs = text_tokenizer(self.class_names, padding=True, return_tensors="pt").input_ids
-
-        self.register_buffer("text_inputs", text_inputs)
-
-    def forward(self, text_model):
-        with torch.no_grad():
-            # Get the standard word embeddings for class names
-            class_name_embs = text_model.get_input_embeddings()(self.text_inputs.to(self.prompt.device))
-        
-        # Prepend the learnable prompt to the class name embeddings
-        # [PROMPT, PROMPT, ..., CLASS_NAME]
-        combined_embs = torch.cat([self.prompt, class_name_embs], dim=1)
-        
-        # Pass the combined embeddings through the rest of the text encoder
-        # This part requires a custom forward pass through the text model layers
-        # For simplicity, we assume we can pass embeddings directly. 
-        # In transformers, you pass it to the encoder layers.
-        
-        # A simplified representation of passing through the encoder:
-        # Note: The actual `transformers` implementation requires passing embeddings
-        # through `model.text_model.encoder` and then `model.text_model.final_layer_norm`.
-        prompted_text_features = text_model(inputs_embeds=combined_embs)
-        
-        return prompted_text_features
-
 
 def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, reg_weight=0.1):
     """
@@ -157,7 +114,7 @@ def LoRA_vision_tuning(
     embedding_dim = base_model.config.vision_config.hidden_size
 
     for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", True)
+        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
         
         # Create classifier and move to device
@@ -312,7 +269,7 @@ def test(model,
          dataset_name,
          input_size,
          device):
-    validation_dataloader, num_query, _ = create_dataloader(dataset_name, input_size, "val", False)
+    validation_dataloader, num_query, _, _ = create_dataloader(dataset_name, input_size, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     with torch.inference_mode():
         for batch in validation_dataloader:

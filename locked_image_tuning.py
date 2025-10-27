@@ -84,7 +84,9 @@ class PromptLearner(nn.Module):
                  text_tokenizer,
                  num_prompt_tokens, 
                  embedding_dim, 
-                 class_names: List[str]):
+                 class_names: List[str],
+                 init_prompts: List[str] = None,
+                 mix_ratio: float = 0.5):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
@@ -96,19 +98,50 @@ class PromptLearner(nn.Module):
 
         # Store tokenized class names
         self.class_names = class_names
+
+        # --- Optional AI-generated prompts ---
+        if init_prompts is not None:
+            assert len(init_prompts) == len(class_names), \
+                "init_prompts must match number of class names"
+            self.init_prompts = init_prompts
+        else:
+            self.init_prompts = [f"a photo of a {name}" for name in class_names]
         # Note: In a full implementation, you'd handle tokenization carefully here.
         text_inputs = text_tokenizer(self.class_names, padding=True, return_tensors="pt").input_ids
+        ai_text_inputs = text_tokenizer(self.init_prompts, padding=True, return_tensors="pt").input_ids
 
         self.register_buffer("text_inputs", text_inputs)
+        self.register_buffer("ai_text_inputs", ai_text_inputs)
+        self.mix_ratio = mix_ratio
 
     def forward(self, text_model):
         with torch.no_grad():
+            emb_layer = text_model.get_input_embeddings()
             # Get the standard word embeddings for class names
-            class_name_embs = text_model.get_input_embeddings()(self.text_inputs.to(self.prompt.device))
+            class_name_embs = emb_layer(self.text_inputs.to(self.prompt.device))
+            ai_prompt_embs = emb_layer(self.ai_text_inputs.to(self.prompt.device))
         
+        # --- Mix the AI-generated and learnable prompts ---
+        # prompt: (N, P, D)
+        # ai_prompt_embs: (N, L, D)
+        # class_name_embs: (N, L', D)
+
+        # Trim or pad the AI prompt embeddings to num_prompt_tokens
+        if ai_prompt_embs.size(1) > self.num_prompt_tokens:
+            ai_prompt_embs = ai_prompt_embs[:, :self.num_prompt_tokens, :]
+        elif ai_prompt_embs.size(1) < self.num_prompt_tokens:
+            pad_len = self.num_prompt_tokens - ai_prompt_embs.size(1)
+            pad = torch.zeros(ai_prompt_embs.size(0), pad_len, ai_prompt_embs.size(2), device=self.prompt.device)
+            ai_prompt_embs = torch.cat([ai_prompt_embs, pad], dim=1)
+        mask = (ai_prompt_embs.abs().sum(dim=-1, keepdim=True) > 0).float()  # 1 if not padded
+        
+        # Blend the AI and learned prompts
+        mixed_prompt = (
+            self.mix_ratio * ai_prompt_embs * mask + (1 - self.mix_ratio) * self.prompt
+        )
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
-        combined_embs = torch.cat([self.prompt, class_name_embs], dim=1)
+        combined_embs = torch.cat([mixed_prompt, class_name_embs], dim=1)
         
         # Pass the combined embeddings through the rest of the text encoder
         # This part requires a custom forward pass through the text model layers
@@ -238,7 +271,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
     all_trainable_params = list(lora_model.parameters())
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
-        train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", False)
+        train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True)
         train_dataloaders.append(train_dataloader)
         
         if isinstance(class_names, str):
@@ -248,7 +281,8 @@ def LoRA_tuning_variable_dataset(dataset_names,
             text_tokenizer=text_tokenizer,
             num_prompt_tokens=N_PROMPT_TOKEN,
             embedding_dim=embedding_dim,
-            class_names=class_names
+            class_names=class_names,
+            init_prompts=ai_prompts
         ).to(device)
         prompt_learners.append(prompt_learner)
         all_trainable_params.extend(list(prompt_learner.parameters()))
@@ -325,7 +359,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
 def test(model,
          dataset_name,
          device):
-    validation_dataloader, num_query, _ = create_dataloader(dataset_name, INPUT_SIZE, "val", False)
+    validation_dataloader, num_query, _, _ = create_dataloader(dataset_name, INPUT_SIZE, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     with torch.inference_mode():
         for batch in validation_dataloader:

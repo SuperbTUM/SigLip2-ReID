@@ -11,6 +11,7 @@ from base_dataset import ImageDataset
 from constants import *
 from market import Market1501
 from veri import VeRi
+from prompt_generator import get_ai_prompt_by_dataset
 
 class PKsamplerWithLabels:
     """
@@ -127,7 +128,7 @@ class RandomIdentitySampler(Sampler):
     def __len__(self):
         return self.length
 
-def create_dataloader(dataset_name, input_size, type, augmented):
+def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False):
     if augmented:
         preprocessing = T.Compose([
             T.Resize(input_size),
@@ -150,6 +151,10 @@ def create_dataloader(dataset_name, input_size, type, augmented):
         dataset = VeRi(verbose=False)
     if type == "train":
         preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
+        if use_ai_prompts:
+            ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size)
+        else:
+            ai_prompts = None
     else:
         preprocessed_dataset = ImageDataset(dataset.query + dataset.gallery, preprocessing)
     dataloader = DataLoader(preprocessed_dataset, 
@@ -157,4 +162,4 @@ def create_dataloader(dataset_name, input_size, type, augmented):
                             shuffle=not augmented, 
                             sampler=RandomIdentitySampler(dataset.train, BATCH_SIZE, N_INSTANCE) if augmented else None,
                             num_workers=N_WORKER)
-    return dataloader, None if type == "train" else len(dataset.query), dataset.num_train_pids if type == "train" else None
+    return dataloader, None if type == "train" else len(dataset.query), dataset.num_train_pids if type == "train" else None, ai_prompts if type == "train" else None

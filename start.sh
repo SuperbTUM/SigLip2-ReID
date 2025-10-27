@@ -3,7 +3,7 @@ apt install python3.12-venv -y
 python3.12 -m venv venv
 source venv/bin/activate
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip3 install peft transformers gdown
+pip3 install peft transformers gdown num2words
 gdown 0B8-rUzbwVRk0c054eEozWG9COHM
 unzip -q Market-1501-v15.09.15.zip
 gdown 0B0o1ZxGs_oVZWmtFdXpqTGl3WUU
