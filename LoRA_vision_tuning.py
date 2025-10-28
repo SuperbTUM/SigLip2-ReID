@@ -143,14 +143,18 @@ def LoRA_vision_tuning(
     base_model.vision_model = base_model.vision_model.train()
     if adalora:
         lora_config = AdaLoraConfig(
-            r=8,
-            init_r=12,
+            target_r=16,
+            init_r=8,
+            beta1=0.85,
+            beta2=0.85,
             tinit=num_batches * 5,
-            tfinal=num_batches * 50,
-            deltaT=num_batches,
+            tfinal=num_batches * 45,
+            deltaT=num_batches * 2,
             target_modules=["q_proj", "v_proj"],
             bias="none",
             total_step=num_batches * N_EPOCHS_VISION,
+            lora_dropout=0.05,
+            init_lora_weights="eva"
         )
     else:
         lora_config = LoraConfig(
@@ -198,12 +202,15 @@ def LoRA_vision_tuning(
 
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
+    modified_text_hidden_states = []
     for prompt_learner in prompt_learners:
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
         with torch.no_grad():
-            modified_text_embeddings.append(prompt_learner(text_model))
+            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model)
+            modified_text_embeddings.append(modified_text_embedding)
+            modified_text_hidden_states.append(modified_text_hidden_state)
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
@@ -236,9 +243,12 @@ def LoRA_vision_tuning(
                 # Sigmoid loss
                 with torch.no_grad():
                     text_features = modified_text_embeddings[i][label]
+                    text_hidden_state = modified_text_hidden_states[i][label]
                 
                 loss_sigmoid = sup_con_loss(image_features, text_features, label) + \
-                               sup_con_loss(text_features, image_features, label)
+                               sup_con_loss(text_features, image_features, label) + \
+                               0.1 * sup_con_loss(last_hidden_state, text_hidden_state, label) + \
+                               0.1 * sup_con_loss(text_hidden_state, last_hidden_state, label)
 
                 # Triplet loss
                 loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \

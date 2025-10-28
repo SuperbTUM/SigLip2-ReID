@@ -622,8 +622,7 @@ class Siglip2TextTransformer(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
-            use_pooled_output: bool = True,
+            inputs_embeds: Optional[torch.Tensor] = None
     ):
         r"""
         Returns:
@@ -660,7 +659,7 @@ class Siglip2TextTransformer(nn.Module):
         pooled_output = last_hidden_state[:, -1, :]
         pooled_output = self.head(pooled_output)
 
-        return pooled_output if use_pooled_output else last_hidden_state
+        return pooled_output, last_hidden_state[:, :-1].mean(dim=1)
 
 
 class SiglipTextModel(nn.Module):
@@ -678,8 +677,7 @@ class SiglipTextModel(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
-            use_pooled_output: bool = True,
+            inputs_embeds: Optional[torch.Tensor] = None
     ):
         r"""
         Returns:
@@ -689,8 +687,7 @@ class SiglipTextModel(nn.Module):
         return self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            use_pooled_output=use_pooled_output
+            inputs_embeds=inputs_embeds
         )
 
 
@@ -774,12 +771,12 @@ class SiglipModel(nn.Module):
         ```"""
         # Use SigLIP model's config for some fields (if specified) instead of those of vision & text components.
 
-        pooled_output = self.text_model(
+        pooled_output, last_hidden_state = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        return pooled_output
+        return pooled_output, last_hidden_state
 
     def get_image_features(
             self,
@@ -813,12 +810,12 @@ class SiglipModel(nn.Module):
         vision_outputs = self.vision_model(
             pixel_values=pixel_values,
             interpolate_pos_encoding=interpolate_pos_encoding,
-        )
+        )[0]
 
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-        )
+        )[0]
 
         image_embeds = vision_outputs[1]
         text_embeds = text_outputs[1]

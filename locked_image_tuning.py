@@ -151,9 +151,9 @@ class PromptLearner(nn.Module):
         # A simplified representation of passing through the encoder:
         # Note: The actual `transformers` implementation requires passing embeddings
         # through `model.text_model.encoder` and then `model.text_model.final_layer_norm`.
-        prompted_text_features = text_model(inputs_embeds=combined_embs)
+        prompted_text_features, prompted_text_hidden_state = text_model(inputs_embeds=combined_embs)
         
-        return prompted_text_features
+        return prompted_text_features, prompted_text_hidden_state
 
 def tuning_preparation(class_names, 
                        device):
@@ -227,7 +227,7 @@ def LoRA_tuning(dataset_name,
             with autocast(device):
                 # 3. Use the Prompt Learner
                 # Pass the initial embeddings through the prompt learner to get the combined embeddings.
-                modified_text_embeddings = prompt_learner(lora_model.text_model)
+                modified_text_embeddings = prompt_learner(lora_model.text_model)[0]
 
                 # 4. Forward pass through the LoRA-adapted model
                 # The model now receives the modified input.
@@ -337,7 +337,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
             label_batch = torch.tensor(label_batch, device=device)
 
             with autocast(device):
-                modified_text_embeddings = prompt_learners[i](lora_model.text_model)
+                modified_text_embeddings = prompt_learners[i](lora_model.text_model)[0]
                 text_features = modified_text_embeddings[label_batch]
                 
                 loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
