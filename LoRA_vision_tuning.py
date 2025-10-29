@@ -62,6 +62,22 @@ class SupervisedSigmoidLoss(nn.Module):
         return loss
 
 
+class GeMPooling(nn.Module):
+    def __init__(self, p_init=1.0, eps=1e-6):
+        super().__init__()
+        # p_raw is the real learnable param
+        # initialize so sigmoid(p_raw) = (p_init - 1) / 5
+        p_raw_init = torch.logit(torch.tensor((p_init - 1.0) / 5.0))
+        self.p_raw = nn.Parameter(p_raw_init)
+        self.eps = eps
+
+    def forward(self, x):
+        # constrain p smoothly to (1,6)
+        p = 1.0 + 5.0 * torch.sigmoid(self.p_raw)
+        x = torch.clamp(x, min=self.eps)
+        return torch.mean(x ** p, dim=(-1, -2)) ** (1.0 / p)
+
+
 def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, reg_weight=0.1):
     """
     Hard triplet mining with flexible, regularized adaptive margin.
@@ -160,14 +176,16 @@ def LoRA_vision_tuning(
         lora_config = LoraConfig(
             r=16,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "v_proj", "out_proj"],
             lora_dropout=0.1,
-            use_dora=True
+            use_dora=True,
+            init_lora_weights="eva"
         )
     # This creates the *new* trainable LoRA parameters
     base_model.vision_model = base_model.vision_model.train()
     vision_model = get_peft_model(base_model.vision_model, lora_config)
     vision_model.print_trainable_parameters()
+    gem_pooling = GeMPooling().to(device)
     vision_model = vision_model.to(device)
 
     # --- 4. NOW Create the Optimizer ---
@@ -177,7 +195,7 @@ def LoRA_vision_tuning(
     optimizer = torch.optim.Adam(
         [
             {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-3, 'weight_decay': 1e-4},           # Group 1: LoRA params
-            {'params': classifier_params, 'lr': 5e-3, 'weight_decay': 1e-4}    # Group 2: Classifier params
+            {'params': classifier_params + list(gem_pooling.parameters()), 'lr': 5e-3, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
     # --- 5. Schedulers and Losses ---
@@ -216,7 +234,9 @@ def LoRA_vision_tuning(
     accumulation_steps = 2  # Adjust as needed
 
     def fwd(x):
-        return vision_model(pixel_values=x, interpolate_pos_encoding=False)
+        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False)
+        last_hidden_state = gem_pooling(last_hidden_state)
+        return image_features, last_hidden_state
     
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
@@ -247,8 +267,8 @@ def LoRA_vision_tuning(
                 
                 loss_sigmoid = sup_con_loss(image_features, text_features, label) + \
                                sup_con_loss(text_features, image_features, label) + \
-                               0.1 * sup_con_loss(last_hidden_state, text_hidden_state, label) + \
-                               0.1 * sup_con_loss(text_hidden_state, last_hidden_state, label)
+                               0.25 * sup_con_loss(last_hidden_state, text_hidden_state, label) + \
+                               0.25 * sup_con_loss(text_hidden_state, last_hidden_state, label)
 
                 # Triplet loss
                 loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \

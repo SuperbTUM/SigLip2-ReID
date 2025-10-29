@@ -3,6 +3,7 @@ import torch
 def save_checkpoint(
         text_model,
         prompt_learners,
+        temperature,
         epoch
 ):
     path = f"checkpoint_epoch_{epoch}.pth"
@@ -12,6 +13,7 @@ def save_checkpoint(
         'epoch': epoch,
         'text_model_state_dict': text_model.state_dict(),
         'prompt_learners_state_dict': prompter_states,
+        'temperature': temperature,
     }
 
     # Save the checkpoint dictionary
@@ -23,6 +25,7 @@ def save_checkpoint(
 def load_checkpoint(
         model,
         prompt_learners,
+        temperature,
         path,
         device):
     checkpoint = torch.load(path, map_location=device)
@@ -30,4 +33,4 @@ def load_checkpoint(
     loaded_prompter_states = checkpoint["prompter_learners_state_dict"]
     for i, state_dict in enumerate(loaded_prompter_states):
         prompt_learners[i].load_state_dict(state_dict)
-    return model, prompt_learners
+    return model, prompt_learners, temperature

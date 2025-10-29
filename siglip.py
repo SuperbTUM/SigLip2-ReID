@@ -469,7 +469,7 @@ class SiglipVisionTransformer(nn.Module):
 
         pooler_output = self.head(last_hidden_state)
 
-        return pooler_output, last_hidden_state[:, 1:, :].mean(dim=1)
+        return pooler_output, last_hidden_state
 
 
 class SiglipVisionModel(nn.Module):
@@ -817,8 +817,8 @@ class SiglipModel(nn.Module):
             attention_mask=attention_mask,
         )[0]
 
-        image_embeds = vision_outputs[1]
-        text_embeds = text_outputs[1]
+        image_embeds = vision_outputs
+        text_embeds = text_outputs
 
         # normalized features
         image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
