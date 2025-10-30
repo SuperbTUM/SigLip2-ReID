@@ -63,20 +63,17 @@ class SupervisedSigmoidLoss(nn.Module):
 
 
 class GeMPooling(nn.Module):
-    def __init__(self, p_init=1.0, eps=1e-6):
+    def __init__(self, p=1.0, eps=1e-6, trainable=True):
         super().__init__()
-        # p_raw is the real learnable param
-        # initialize so sigmoid(p_raw) = (p_init - 1) / 5
-        p_raw_init = torch.logit(torch.tensor((p_init - 1.0) / 5.0))
-        self.p_raw = nn.Parameter(p_raw_init)
+        self.p = nn.Parameter(torch.ones(1) * p) if trainable else p
         self.eps = eps
 
     def forward(self, x):
-        # constrain p smoothly to (1,6)
-        p = 1.0 + 5.0 * torch.sigmoid(self.p_raw)
-        x = torch.clamp(x, min=self.eps)
-        return torch.mean(x ** p, dim=(-1, -2)) ** (1.0 / p)
-
+        # x: [B, N, D]
+        p = self.p.clamp(1.0, 6.0)
+        x = x.clamp(min=self.eps).pow(p)
+        x = x.mean(dim=1).pow(1.0 / p)
+        return x
 
 def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, reg_weight=0.1):
     """
@@ -132,7 +129,7 @@ def LoRA_vision_tuning(
     for dataset_name, input_size in zip(dataset_names, input_sizes):
         train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
-        
+
         # Create classifier and move to device
         # Classifier: BatchNorm + FC
         classifier = nn.Sequential(

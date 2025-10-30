@@ -261,6 +261,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
         lora_dropout=0.1,
         use_dora=True
     )
+    frozen_text_model = copy.deepcopy(base_model.text_model).to(device)
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
     lora_model = base_model.to(device)
     embedding_dim = lora_model.config.text_config.hidden_size
@@ -337,12 +338,16 @@ def LoRA_tuning_variable_dataset(dataset_names,
             label_batch = torch.tensor(label_batch, device=device)
 
             with autocast(device):
+                with torch.no_grad():
+                    frozen_modified_text_embeddings = prompt_learners[i](frozen_text_model)[0]
+                    frozen_text_features = frozen_modified_text_embeddings[label_batch]
                 modified_text_embeddings = prompt_learners[i](lora_model.text_model)[0]
                 text_features = modified_text_embeddings[label_batch]
                 
                 loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
                         sup_con_loss(image_features_batch, text_features, label_batch)
-                total_loss += loss
+                loss_align = F.mse_loss(text_features, frozen_text_features.detach())
+                total_loss += loss + 0.1 * loss_align
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
