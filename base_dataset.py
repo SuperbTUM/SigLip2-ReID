@@ -66,9 +66,10 @@ class BaseImageDataset(BaseDataset):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, dataset, transform=None):
+    def __init__(self, dataset, transform=None, transform2=None):
         self.dataset = dataset
         self.transform = transform
+        self.transform2 = transform2
 
     def __len__(self):
         return len(self.dataset)
@@ -76,8 +77,14 @@ class ImageDataset(Dataset):
     def __getitem__(self, index):
         img_path, pid, camid, trackid = self.dataset[index]
         img = read_image(img_path)
+        img2 = None
+
+        if self.transform2 is not None:
+            img2 = self.transform2(img)
 
         if self.transform is not None:
             img = self.transform(img)
 
+        if self.transform2 is not None:
+            return img, pid, camid, trackid, img_path.split('/')[-1], img2
         return img, pid, camid, trackid, img_path.split('/')[-1]

@@ -1,7 +1,9 @@
 import model
 from constants import *
 from data_preparation import *
+from checkpoint import *
 from evaluation import R1_mAP_eval_pt
+from locked_image_tuning import LoRA_tuning_variable_dataset
 
 import torch
 import torch.nn as nn
@@ -13,7 +15,7 @@ import itertools
 from functools import partial
 
 from peft import get_peft_model, AdaLoraConfig, LoraConfig
-from locked_image_tuning import LoRA_tuning_variable_dataset
+
 
 torch.backends.cuda.matmul.allow_tf32 = True  # on Ampere+
 torch.backends.cudnn.benchmark = True
@@ -127,7 +129,7 @@ def LoRA_vision_tuning(
     embedding_dim = base_model.config.vision_config.hidden_size
 
     for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True)
+        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, dual_branch=True)
         train_dataloaders.append(train_dataloader)
 
         # Create classifier and move to device
@@ -246,8 +248,9 @@ def LoRA_vision_tuning(
             total_loss = 0
             i, dataloader_iter = next(round_robin_iter)
 
-            image_tensor, label = next(dataloader_iter)[:2]
+            image_tensor, label, _, _, _, image_tensor_orig = next(dataloader_iter)
             image_tensor = image_tensor.to(device)
+            image_tensor_orig = image_tensor_orig.to(device)
             label = label.to(device)
 
             with autocast(device, torch.float16):
@@ -256,16 +259,18 @@ def LoRA_vision_tuning(
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
                 loss_ce = criterion(logits, label)
+
+                image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, use_reentrant=False)
                 
                 # Sigmoid loss
                 with torch.no_grad():
                     text_features = modified_text_embeddings[i][label]
                     text_hidden_state = modified_text_hidden_states[i][label]
                 
-                loss_sigmoid = sup_con_loss(image_features, text_features, label) + \
-                               sup_con_loss(text_features, image_features, label) + \
-                               0.25 * sup_con_loss(last_hidden_state, text_hidden_state, label) + \
-                               0.25 * sup_con_loss(text_hidden_state, last_hidden_state, label)
+                loss_sigmoid = sup_con_loss(image_features_orig, text_features, label) + \
+                               sup_con_loss(text_features, image_features_orig, label) + \
+                               0.25 * sup_con_loss(last_hidden_state_orig, text_hidden_state, label) + \
+                               0.25 * sup_con_loss(text_hidden_state, last_hidden_state_orig, label)
 
                 # Triplet loss
                 loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \
@@ -290,6 +295,7 @@ def LoRA_vision_tuning(
 
     vision_model = vision_model.merge_and_unload()
     base_model.vision_model = vision_model
+    save_checkpoint(base_model, prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_VISION, optimizer, scheduler)
     return base_model.eval()
 
 def test(model,

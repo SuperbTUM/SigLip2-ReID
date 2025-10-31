@@ -128,7 +128,12 @@ class RandomIdentitySampler(Sampler):
     def __len__(self):
         return self.length
 
-def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False):
+def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False, dual_branch=False):
+    unaugment_preprocessing = T.Compose([
+            T.Resize(input_size),
+            T.ToTensor(),
+            T.Normalize(mean=0.5, std=0.5)
+        ])
     if augmented:
         preprocessing = T.Compose([
             T.Resize(input_size),
@@ -150,7 +155,10 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
     elif dataset_name == "veri":
         dataset = VeRi(verbose=False)
     if type == "train":
-        preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
+        if dual_branch:
+            preprocessed_dataset = ImageDataset(dataset.train, preprocessing, unaugment_preprocessing)
+        else:
+            preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
         if use_ai_prompts:
             ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size)
         else:
