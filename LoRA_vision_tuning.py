@@ -121,7 +121,8 @@ def LoRA_vision_tuning(
         device,
         adalora=False
 ):
-
+    if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth"):
+        base_model, prompt_learners, temperature, _, _ = load_checkpoint(base_model, prompt_learners, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
     classifiers = []
@@ -139,6 +140,7 @@ def LoRA_vision_tuning(
             nn.Linear(embedding_dim, n_cls, bias=False),
             
         ).to(device)
+        classifier[0].bias.requires_grad_(False)
         classifiers.append(classifier)
         
         # Add its parameters to the list
@@ -175,7 +177,7 @@ def LoRA_vision_tuning(
         lora_config = LoraConfig(
             r=16,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "out_proj"],
+            target_modules=["q_proj", "v_proj", "out_proj", "mlp.fc1", "mlp.fc2", "ln_1", "ln_2"], # Experiment
             lora_dropout=0.1,
             use_dora=True,
             init_lora_weights="eva"
@@ -215,7 +217,7 @@ def LoRA_vision_tuning(
         schedulers=[warmup_scheduler, multistep_scheduler],
         milestones=[5]
     )
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
+    criterion = [nn.CrossEntropyLoss(label_smoothing=0.05).to(device), nn.CrossEntropyLoss(label_smoothing=0.1).to(device)]
 
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
@@ -258,7 +260,7 @@ def LoRA_vision_tuning(
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
-                loss_ce = criterion(logits, label)
+                loss_ce = criterion[i](logits, label)
 
                 image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, use_reentrant=False)
                 

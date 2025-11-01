@@ -1,6 +1,7 @@
 import model
 from constants import *
 from data_preparation import *
+from checkpoint import *
 from evaluation import R1_mAP_eval_pt
 
 import transformers
@@ -358,7 +359,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     
     base_model.text_model = lora_model.text_model.merge_and_unload()
-
+    save_checkpoint(base_model, prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, optimizer, scheduler)
     return base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item()
 
 def test(model,

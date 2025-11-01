@@ -29,7 +29,6 @@ def save_checkpoint(
 def load_checkpoint(
         model,
         prompt_learners,
-        temperature,
         optimizer,
         scheduler,
         path,
@@ -37,8 +36,11 @@ def load_checkpoint(
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     loaded_prompter_states = checkpoint["prompter_learners_state_dict"]
+    temperature = checkpoint["temperature"]
     for i, state_dict in enumerate(loaded_prompter_states):
         prompt_learners[i].load_state_dict(state_dict)
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler.load_state_dict(checkpoint["scheduler"])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if scheduler is not None:
+        scheduler.load_state_dict(checkpoint["scheduler"])
     return model, prompt_learners, temperature, optimizer, scheduler
