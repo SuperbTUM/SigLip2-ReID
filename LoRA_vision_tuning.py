@@ -177,7 +177,7 @@ def LoRA_vision_tuning(
         lora_config = LoraConfig(
             r=16,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "out_proj", "mlp.fc1", "mlp.fc2", "ln_1", "ln_2"], # Experiment
+            target_modules=["q_proj", "v_proj", "out_proj", "k_proj"], # Experiment
             lora_dropout=0.1,
             use_dora=True,
             init_lora_weights="eva"

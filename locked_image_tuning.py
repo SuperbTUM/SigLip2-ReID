@@ -129,7 +129,10 @@ class PromptLearner(nn.Module):
 
         # Trim or pad the AI prompt embeddings to num_prompt_tokens
         if ai_prompt_embs.size(1) > self.num_prompt_tokens:
-            ai_prompt_embs = ai_prompt_embs[:, :self.num_prompt_tokens, :]
+            ai_prompt_embs = F.adaptive_avg_pool1d(
+                ai_prompt_embs.transpose(1, 2),
+                self.num_prompt_tokens
+            ).transpose(1, 2)
         elif ai_prompt_embs.size(1) < self.num_prompt_tokens:
             pad_len = self.num_prompt_tokens - ai_prompt_embs.size(1)
             pad = torch.zeros(ai_prompt_embs.size(0), pad_len, ai_prompt_embs.size(2), device=self.prompt.device)
