@@ -87,7 +87,7 @@ class PromptLearner(nn.Module):
                  embedding_dim, 
                  class_names: List[str],
                  init_prompts: List[str] = None,
-                 mix_ratio: float = 0.5):
+                 mix_ratio: float = 0.):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
@@ -113,7 +113,7 @@ class PromptLearner(nn.Module):
 
         self.register_buffer("text_inputs", text_inputs)
         self.register_buffer("ai_text_inputs", ai_text_inputs)
-        self.mix_ratio = mix_ratio
+        self.mix_ratio = nn.Parameter(torch.tensor(mix_ratio))
 
     def forward(self, text_model):
         with torch.no_grad():
@@ -140,8 +140,9 @@ class PromptLearner(nn.Module):
         mask = (ai_prompt_embs.abs().sum(dim=-1, keepdim=True) > 0).float()  # 1 if not padded
         
         # Blend the AI and learned prompts
+        mix_ratio = torch.sigmoid(self.mix_ratio)
         mixed_prompt = (
-            self.mix_ratio * ai_prompt_embs * mask + (1 - self.mix_ratio) * self.prompt
+            mix_ratio * ai_prompt_embs * mask + (1.0 - mix_ratio) * self.prompt
         )
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
@@ -263,7 +264,8 @@ def LoRA_tuning_variable_dataset(dataset_names,
         lora_alpha=16,
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.1,
-        use_dora=True
+        use_dora=True,
+        init_lora_weights="pissa_niter_4"
     )
     frozen_text_model = copy.deepcopy(base_model.text_model).to(device)
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
@@ -350,7 +352,9 @@ def LoRA_tuning_variable_dataset(dataset_names,
                 
                 loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
                         sup_con_loss(image_features_batch, text_features, label_batch)
-                loss_align = F.mse_loss(text_features, frozen_text_features.detach())
+                loss_align = 1.0 - F.cosine_similarity(
+                                        text_features, frozen_text_features.detach(), dim=1
+                                        ).mean()
                 total_loss += loss + 0.1 * loss_align
 
             scaler.scale(total_loss).backward()
@@ -362,7 +366,9 @@ def LoRA_tuning_variable_dataset(dataset_names,
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     
     base_model.text_model = lora_model.text_model.merge_and_unload()
-    save_checkpoint(base_model, prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, optimizer, scheduler)
+    for prompt_learner in prompt_learners:
+        prompt_learner.eval()
+    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, optimizer, scheduler)
     return base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item()
 
 def test(model,

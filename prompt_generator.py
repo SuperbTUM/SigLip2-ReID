@@ -1,4 +1,5 @@
 import random
+from PIL import Image
 from collections import defaultdict
 import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText
@@ -27,10 +28,16 @@ def generate_prompt(image_paths, input_size):
     messages_batch = [
         [
             {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "You are a Re-Identification assistant. Focus on describing unique, identity-specific visual features, ignoring background or pose."}
+                ]
+            },
+            {
                 "role": "user",
                 "content": [
                     {"type": "image", "path": img_path},
-                    {"type": "text", "text": "Can you describe this image in one sentence?"},
+                    {"type": "text", "text": "Describe this image in one sentence."},
                 ]
             } 
         ] for img_path in image_paths
@@ -48,17 +55,26 @@ def generate_prompt(image_paths, input_size):
             return_tensors="pt",
         ).to(model.device, dtype=torch.bfloat16)
 
-        # Generate text
-        generated_ids = model.generate(**inputs, do_sample=False, max_new_tokens=64)
+        # Generate output
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+            )
 
-        # Decode output
-        generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
+        # Decode
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         # Collect the response
-        all_generated_texts.append(generated_texts[0].split("\n")[1].replace("Assistant: ", ""))  # single response per image
+        all_generated_texts.append(generated_text.split("\n")[2].replace("Assistant: ", "").strip())  # single response per image
 
     return all_generated_texts
 
-def get_ai_prompt_by_dataset(dataset, num_pids, input_size):
+def get_ai_prompt_by_dataset(dataset, num_pids, input_size, dataset_name):
     img_paths = sample_dataset(dataset, num_pids)
-    return generate_prompt(img_paths, input_size)
+    all_generated_texts = generate_prompt(img_paths, input_size)
+    with open(f"prompts_{dataset_name}.txt", "w", encoding="utf-8") as f:
+        for generated_prompt in all_generated_texts:
+            f.write(generated_prompt + "\n")
+    return all_generated_texts
