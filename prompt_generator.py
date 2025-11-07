@@ -15,7 +15,7 @@ def sample_dataset(dataset, num_pids):
     return samples
 
 
-def generate_prompt(image_paths, input_size):
+def generate_prompt(image_paths, input_size, class_name):
 
     model_path = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
     processor = AutoProcessor.from_pretrained(model_path)
@@ -25,19 +25,29 @@ def generate_prompt(image_paths, input_size):
         torch_dtype=torch.bfloat16
     ).to("cuda")
 
+    system_prompt = f"""
+        You are a Re-Identification assistant for {class_name} object. Focus on describing unique, identity-specific visual features, ignoring background or pose of the {class_name} in the image. 
+        Always start with "A {class_name}..." and keep the response in 64 words or less.
+    """
+    user_prompts = [
+        f"Describe the unique visual traits that distinguish this {class_name} from others of the same type.",
+        f"What fine-grained details identify this exact {class_name}?",
+        f"Summarize only the distinctive color, texture, and shape features of this {class_name}.",
+    ]
+
     messages_batch = [
         [
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": "You are a Re-Identification assistant. Focus on describing unique, identity-specific visual features, ignoring background or pose."}
+                    {"type": "text", "text": system_prompt}
                 ]
             },
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "path": img_path},
-                    {"type": "text", "text": "Describe this image in one sentence."},
+                    {"type": "text", "text": random.choice(user_prompts)},
                 ]
             } 
         ] for img_path in image_paths
@@ -67,13 +77,13 @@ def generate_prompt(image_paths, input_size):
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         # Collect the response
-        all_generated_texts.append(generated_text.split("\n")[2].replace("Assistant: ", "").strip())  # single response per image
+        all_generated_texts.append(generated_text.split("\n")[5].replace("Assistant: ", "").strip())  # single response per image
 
     return all_generated_texts
 
-def get_ai_prompt_by_dataset(dataset, num_pids, input_size, dataset_name):
+def get_ai_prompt_by_dataset(dataset, num_pids, input_size, dataset_name, class_name):
     img_paths = sample_dataset(dataset, num_pids)
-    all_generated_texts = generate_prompt(img_paths, input_size)
+    all_generated_texts = generate_prompt(img_paths, input_size, class_name)
     with open(f"prompts_{dataset_name}.txt", "w", encoding="utf-8") as f:
         for generated_prompt in all_generated_texts:
             f.write(generated_prompt + "\n")

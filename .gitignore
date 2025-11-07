@@ -6,3 +6,4 @@ VeRi/*
 venv/
 __pycache__/
 *.pth
+*.txt

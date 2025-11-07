@@ -152,8 +152,10 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
         ])
     if dataset_name == "Market1501":
         dataset = Market1501(verbose=False)
+        class_name = "person"
     elif dataset_name == "veri":
         dataset = VeRi(verbose=False)
+        class_name = "vehicle"
     if type == "train":
         if dual_branch:
             preprocessed_dataset = ImageDataset(dataset.train, preprocessing, unaugment_preprocessing)
@@ -164,7 +166,7 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
                 with open(f"prompts_{dataset_name}.txt", "r", encoding="utf-8") as f:
                     ai_prompts = [prompt.strip() for prompt in f.readlines()]
             else:
-                ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size, dataset_name)
+                ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size, dataset_name, class_name)
         else:
             ai_prompts = None
     else:
