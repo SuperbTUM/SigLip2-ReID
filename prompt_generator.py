@@ -27,12 +27,12 @@ def generate_prompt(image_paths, input_size, class_name):
 
     system_prompt = f"""
         You are a Re-Identification assistant for {class_name} object. Focus on describing unique, identity-specific visual features, ignoring background or pose of the {class_name} in the image. 
-        Always start with "A {class_name}..." and keep the response in 64 words or less.
+        Always start with "A {class_name}..." and keep the response in 16 words or fewer while providing as many notable details as possible.
     """
     user_prompts = [
-        f"Describe the unique visual traits that distinguish this {class_name} from others of the same type.",
-        f"What fine-grained details identify this exact {class_name}?",
-        f"Summarize only the distinctive color, texture, and shape features of this {class_name}.",
+        f"In one sentence, describe the unique visual traits that distinguish this {class_name} from others of the same type.",
+        f"In one sentence, what fine-grained details identify this exact {class_name}?",
+        f"In one sentence, summarize only the distinctive color, texture, and shape features of this {class_name}.",
     ]
 
     messages_batch = [
@@ -69,7 +69,7 @@ def generate_prompt(image_paths, input_size, class_name):
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
-                max_new_tokens=64,
+                max_new_tokens=16,
                 do_sample=False,
             )
 

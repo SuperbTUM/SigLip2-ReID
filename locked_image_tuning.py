@@ -127,29 +127,9 @@ class PromptLearner(nn.Module):
         # ai_prompt_embs: (N, L, D)
         # class_name_embs: (N, L', D)
 
-        # Trim or pad the AI prompt embeddings to num_prompt_tokens
-        if ai_prompt_embs.size(1) > self.num_prompt_tokens:
-            excess = ai_prompt_embs.size(1) - self.num_prompt_tokens
-            start = excess // 2
-            ai_prompt_embs_truncate = ai_prompt_embs[:, start:start + self.num_prompt_tokens, :]
-            ai_prompt_embs_pool = F.adaptive_avg_pool1d(
-                ai_prompt_embs.transpose(1, 2),
-                self.num_prompt_tokens
-            ).transpose(1, 2)
-            ai_prompt_embs = 0.5 * (ai_prompt_embs_truncate + ai_prompt_embs_pool)
-        elif ai_prompt_embs.size(1) < self.num_prompt_tokens:
-            pad_len = self.num_prompt_tokens - ai_prompt_embs.size(1)
-            pad = torch.zeros(ai_prompt_embs.size(0), pad_len, ai_prompt_embs.size(2), device=self.prompt.device)
-            ai_prompt_embs = torch.cat([ai_prompt_embs, pad], dim=1)
-        mask = (ai_prompt_embs.abs().sum(dim=-1, keepdim=True) > 0).float()  # 1 if not padded
-        
-        # Blend the AI and learned prompts
-        mix_ratio = torch.sigmoid(self.mix_ratio)
-        mixed_prompt = (
-            mix_ratio * ai_prompt_embs * mask + (1.0 - mix_ratio) * self.prompt
-        )
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
+        mixed_prompt = ai_prompt_embs[:, 1:, :] + self.prompt
         combined_embs = torch.cat([mixed_prompt, class_name_embs], dim=1)
         
         # Pass the combined embeddings through the rest of the text encoder
@@ -302,8 +282,19 @@ def LoRA_tuning_variable_dataset(dataset_names,
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
-
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,      
+        end_factor=1.0,
+        total_iters=10
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA-10, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[10]
+    )
+    
     # --- Pre-extract image features for all datasets ---
     image_features_lists = []
     image_label_lists = []
