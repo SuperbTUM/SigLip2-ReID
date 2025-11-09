@@ -180,7 +180,8 @@ def LoRA_vision_tuning(
             target_modules=["q_proj", "v_proj", "out_proj", "k_proj"], # Experiment
             lora_dropout=0.1,
             use_dora=True,
-            init_lora_weights="eva"
+            init_lora_weights="eva",
+            modules_to_save=["vision_model.domain_embedding"]
         )
     # This creates the *new* trainable LoRA parameters
     base_model.vision_model = base_model.vision_model.train()
@@ -234,8 +235,8 @@ def LoRA_vision_tuning(
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
 
-    def fwd(x):
-        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False)
+    def fwd(x, y=None):
+        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False, domain_id=y)
         last_hidden_state = gem_pooling(last_hidden_state)
         return image_features, last_hidden_state
     
@@ -256,13 +257,13 @@ def LoRA_vision_tuning(
             label = label.to(device)
 
             with autocast(device, torch.float16):
-                image_features, last_hidden_state = checkpoint(fwd, image_tensor, use_reentrant=False)
+                image_features, last_hidden_state = checkpoint(fwd, image_tensor, torch.zeros_like(label) if (i%1) else torch.ones_like(label), use_reentrant=False)
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
                 loss_ce = criterion[i](logits, label)
 
-                image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, use_reentrant=False)
+                image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, torch.zeros_like(label) if (i%1) else torch.ones_like(label), use_reentrant=False)
                 
                 # Sigmoid loss
                 with torch.no_grad():
@@ -312,7 +313,7 @@ def test(model,
             img = img.to(device)
             label = label.to(device)
             cam = cam.to(device)
-            test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)[0]
+            test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_id=torch.zeros_like(label) if dataset_name == "Market1501" else torch.ones_like(label))[0]
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()

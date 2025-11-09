@@ -244,10 +244,11 @@ def LoRA_tuning_variable_dataset(dataset_names,
     base_model = model.load_weights(MODEL_NAME)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
     lora_config = LoraConfig(
-        r=16,
+        r=8,
         lora_alpha=16,
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.1,
+        bias="none",
         use_dora=True,
         init_lora_weights="pissa_niter_4"
     )

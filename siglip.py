@@ -53,6 +53,7 @@ class SiglipvisionConfig:
             attention_dropout=0.0,
             num_image_tokens: int = None,
             version="siglip2",
+            num_domains=2,
             **kwargs
     ):
         super().__init__()
@@ -69,6 +70,7 @@ class SiglipvisionConfig:
         self.layer_norm_eps = layer_norm_eps
         self.num_image_tokens = num_image_tokens
         self.version = version
+        self.num_domains = num_domains
 
     def get(self, key, default=None):
         return getattr(self, key, default)
@@ -95,7 +97,9 @@ class SiglipVisionEmbedding(nn.Module):
         else:
             self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
+        self.num_domains = config.num_domains
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+        self.domain_embedding = nn.Embedding(self.num_domains, self.embed_dim)
         self.register_buffer(
             "position_ids",
             torch.arange(self.num_positions).expand((1, -1)),
@@ -140,7 +144,7 @@ class SiglipVisionEmbedding(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return patch_pos_embed
 
-    def forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False) -> torch.Tensor:
+    def forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False, domain_id: torch.Tensor=None) -> torch.Tensor:
         _, _, height, width = pixel_values.shape  # [Batch_Size, Channels, Height, Width]
         # Convolve the 'patch_size' kernal over the image, with no overlapping patches since the stide is equal
         # The output of the convolution will have shape [Batch_Size, Embed_Dim, Num_Patches_H, Num_Patches_W]
@@ -156,6 +160,8 @@ class SiglipVisionEmbedding(nn.Module):
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
         else:
             embeddings = embeddings + self.position_embedding(self.position_ids)
+        if domain_id is not None:
+            embeddings = embeddings + self.domain_embedding(domain_id).unsqueeze(1)
         # [Batch_Size, Num_Patches, Embed_Dim]
         return embeddings
 
@@ -166,6 +172,7 @@ class Siglip2VisionEmbeddings(nn.Module):
         self.config = config
         self.embed_dim = config.hidden_size
         self.patch_size = config.patch_size
+        self.num_domains = config.num_domains
 
         self.patch_embedding = nn.Linear(
             in_features=config.num_channels * self.patch_size * self.patch_size,
@@ -175,6 +182,7 @@ class Siglip2VisionEmbeddings(nn.Module):
         self.num_patches = config.num_patches
         self.position_embedding_size = int(self.num_patches**0.5)
         self.position_embedding = nn.Embedding(self.num_patches, self.embed_dim)
+        self.domain_embedding = nn.Embedding(self.num_domains, self.embed_dim)
 
     @staticmethod
     def resize_positional_embeddings(
@@ -235,7 +243,7 @@ class Siglip2VisionEmbeddings(nn.Module):
 
         return resulted_positional_embeddings
 
-    def forward(self, pixel_values: torch.FloatTensor, spatial_shapes: torch.LongTensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.FloatTensor, spatial_shapes: torch.LongTensor, domain_id: torch.Tensor) -> torch.Tensor:
         """
         Args:
             pixel_values (`torch.FloatTensor`):
@@ -258,6 +266,8 @@ class Siglip2VisionEmbeddings(nn.Module):
 
         # Add positional embeddings to patch embeddings
         embeddings = patch_embeds + resized_positional_embeddings
+        if domain_id is not None:
+            embeddings = embeddings + self.domain_embedding(domain_id).unsqueeze(1)
         return embeddings
 
 
@@ -453,14 +463,14 @@ class SiglipVisionTransformer(nn.Module):
             mask[:, -padding_length:] = 0
         return image, mask
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None, domain_id: torch.Tensor = None) -> torch.Tensor:
         # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embedding_Dimension]
         attention_mask = None
         if self.config.version == "siglip":
             hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding)
         else:
             pixel_values, attention_mask = self.pad_along_first_dim(self.convert_image_to_patches(pixel_values, self.config.patch_size), self.config.num_patches)
-            hidden_states = self.embeddings(pixel_values, spatial_shapes)
+            hidden_states = self.embeddings(pixel_values, spatial_shapes, domain_id)
             attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype, hidden_states.shape[1])
 
         last_hidden_state = self.encoder(inputs_embeds=hidden_states, attention_mask=attention_mask)
@@ -479,12 +489,12 @@ class SiglipVisionModel(nn.Module):
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool, domain_id: torch.Tensor = None) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
         bs, _, h, w = pixel_values.shape
         spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
         return self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
-                                 spatial_shapes=spatial_shapes)
+                                 spatial_shapes=spatial_shapes, domain_id=domain_id)
 
 
 class SiglipTextConfig:
@@ -782,6 +792,7 @@ class SiglipModel(nn.Module):
             self,
             pixel_values: Optional[torch.FloatTensor] = None,
             interpolate_pos_encoding: bool = False,
+            domain_id: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         r"""
         Returns:
@@ -794,6 +805,7 @@ class SiglipModel(nn.Module):
         pooled_output, last_hidden_state = self.vision_model(
             pixel_values=pixel_values,
             interpolate_pos_encoding=interpolate_pos_encoding,
+            domain_id=domain_id,
         )
 
         return pooled_output, last_hidden_state
