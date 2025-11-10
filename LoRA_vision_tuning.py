@@ -157,6 +157,7 @@ def LoRA_vision_tuning(
     text_model = text_model.to(device)
 
     # --- 3. Apply PEFT to the Vision Model ---
+    base_model.vision_model.vision_model.embeddings.domain_embedding.weight.data.normal_(mean=0.0, std=0.02)
     base_model.vision_model = base_model.vision_model.train()
     if adalora:
         lora_config = AdaLoraConfig(
@@ -181,10 +182,9 @@ def LoRA_vision_tuning(
             lora_dropout=0.1,
             use_dora=True,
             init_lora_weights="eva",
-            modules_to_save=["vision_model.domain_embedding"]
+            modules_to_save=["domain_embedding"]
         )
     # This creates the *new* trainable LoRA parameters
-    base_model.vision_model = base_model.vision_model.train()
     vision_model = get_peft_model(base_model.vision_model, lora_config)
     vision_model.print_trainable_parameters()
     gem_pooling = GeMPooling().to(device)

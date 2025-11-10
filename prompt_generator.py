@@ -1,3 +1,4 @@
+import re
 import random
 from PIL import Image
 from collections import defaultdict
@@ -18,7 +19,7 @@ def sample_dataset(dataset, num_pids):
 def generate_prompt(image_paths, input_size, class_name):
 
     model_path = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
-    processor = AutoProcessor.from_pretrained(model_path)
+    processor = AutoProcessor.from_pretrained(model_path, padding_side="left")
     processor.image_processor.size = {"height": input_size[0], "width": input_size[1]}
     model = AutoModelForImageTextToText.from_pretrained(
         model_path,
@@ -54,30 +55,32 @@ def generate_prompt(image_paths, input_size, class_name):
     ]
 
     all_generated_texts = []
+    batch_size = 32
 
-    for messages in messages_batch:
+    for i in range(0, len(messages_batch), batch_size):
         # Apply chat template
         inputs = processor.apply_chat_template(
-            messages,
+            messages_batch[i:i+batch_size],
             add_generation_prompt=True,
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
+            padding=True
         ).to(model.device, dtype=torch.bfloat16)
 
         # Generate output
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
-                max_new_tokens=16,
+                max_new_tokens=20,
                 do_sample=False,
             )
 
         # Decode
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
-        # Collect the response
-        all_generated_texts.append(generated_text.split("\n")[5].replace("Assistant: ", "").strip())  # single response per image
+        for generated_text in processor.batch_decode(generated_ids, skip_special_tokens=True):
+            # Collect the response
+            generated_text = generated_text.split("\n")[5].replace("Assistant: ", "").strip()
+            all_generated_texts.append(re.sub(r"[.,;:!?]", "", generated_text))  # single response per image
 
     return all_generated_texts
 

@@ -86,8 +86,7 @@ class PromptLearner(nn.Module):
                  num_prompt_tokens, 
                  embedding_dim, 
                  class_names: List[str],
-                 init_prompts: List[str] = None,
-                 mix_ratio: float = 0.):
+                 init_prompts: List[str] = None):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
@@ -113,7 +112,6 @@ class PromptLearner(nn.Module):
 
         self.register_buffer("text_inputs", text_inputs)
         self.register_buffer("ai_text_inputs", ai_text_inputs)
-        self.mix_ratio = nn.Parameter(torch.tensor(mix_ratio))
 
     def forward(self, text_model):
         with torch.no_grad():
@@ -129,7 +127,7 @@ class PromptLearner(nn.Module):
 
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
-        mixed_prompt = ai_prompt_embs[:, 1:, :] + self.prompt
+        mixed_prompt = ai_prompt_embs[:, 1:1+self.num_prompt_tokens, :] + self.prompt
         combined_embs = torch.cat([mixed_prompt, class_name_embs], dim=1)
         
         # Pass the combined embeddings through the rest of the text encoder
