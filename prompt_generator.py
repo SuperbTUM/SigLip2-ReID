@@ -72,7 +72,7 @@ def generate_prompt(image_paths, input_size, class_name):
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
-                max_new_tokens=20,
+                max_new_tokens=16,
                 do_sample=False,
             )
 
@@ -80,7 +80,7 @@ def generate_prompt(image_paths, input_size, class_name):
         for generated_text in processor.batch_decode(generated_ids, skip_special_tokens=True):
             # Collect the response
             generated_text = generated_text.split("\n")[5].replace("Assistant: ", "").strip()
-            all_generated_texts.append(re.sub(r"[.,;:!?]", "", generated_text))  # single response per image
+            all_generated_texts.append(generated_text)  # single response per image
 
     return all_generated_texts
 

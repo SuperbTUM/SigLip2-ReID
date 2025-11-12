@@ -40,49 +40,100 @@ class SupConLoss(nn.Module):
 
         return loss
 
-class SupervisedSigmoidLoss(nn.Module):
-    """
-    A sigmoid-based loss inspired by Supervised Contrastive learning.
-
-    It can operate in two modes:
-    1.  Instance-level (default): Assumes image_i matches text_i.
-    2.  Supervised-level: If class_labels are provided, it treats all samples
-        with the same label as positive pairs.
-    """
-    def __init__(self, temperature: float = 1.0, reduction: str = 'mean'):
+class MoCoInfoNCELoss(nn.Module):
+    def __init__(self, 
+                 feature_dim: int, 
+                 queue_size: int = 1024,
+                 momentum: float = 0.999,
+                 temperature: float = 1.0):
         super().__init__()
         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
-        self.reduction = reduction
+        self.queue_size = queue_size
+        self.momentum = momentum
 
-    def forward(self, 
-              image_features: torch.Tensor, 
-              text_features: torch.Tensor,
-              class_labels: Optional[torch.Tensor]):
+        # --- Memory queues for negatives ---
+        self.register_buffer("image_queue", torch.randn(queue_size, feature_dim))
+        self.register_buffer("text_queue",  torch.randn(queue_size, feature_dim))
+        self.image_queue = F.normalize(self.image_queue, dim=1)
+        self.text_queue  = F.normalize(self.text_queue,  dim=1)
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+        # --- Momentum encoders (initialized later externally) ---
+        self.image_encoder_m = None
+        self.text_encoder_m = None
+
+    @torch.no_grad()
+    def _momentum_update(self, model, model_m):
+        """Update momentum encoder parameters."""
+        for param_q, param_k in zip(model.parameters(), model_m.parameters()):
+            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys_img, keys_txt):
+        """Update the queue with new keys."""
+        batch_size = keys_img.shape[0]
+        ptr = int(self.queue_ptr)
+        assert self.queue_size % batch_size == 0  # for simplicity
+
+        self.image_queue[ptr:ptr + batch_size, :] = keys_img
+        self.text_queue[ptr:ptr + batch_size, :] = keys_txt
+        ptr = (ptr + batch_size) % self.queue_size
+        self.queue_ptr[0] = ptr
+
+    def forward(self, image_features, text_features, 
+                image_encoder=None, text_encoder=None):
         """
-        Computes the Supervised Sigmoid Loss.
-
-        Args:
-            image_features (torch.Tensor): Normalized image embeddings (N, D).
-            text_features (torch.Tensor): Normalized text embeddings (N, D).
-            class_labels (Optional[torch.Tensor]): A 1D tensor of class labels (N,).
-                                                   If None, performs standard instance-level
-                                                   matching.
-        
-        Returns:
-            torch.Tensor: The computed loss value.
+        image_features, text_features: outputs from *main* encoders
+        image_encoder, text_encoder: optional main encoders for momentum update
         """
-        temperature = self.temperature.exp().clamp(0.1, 10.0)
-        logits = torch.matmul(image_features, text_features.t()) * temperature
+        T = self.temperature.exp().clamp(0.1, 10.0)
 
-        labels = torch.arange(logits.shape[0], device=logits.device)
+        # ----- Main (in-batch) contrastive logits -----
+        logits_img2txt = image_features @ text_features.t() * T  # [B, B]
+        labels = torch.arange(logits_img2txt.size(0), device=logits_img2txt.device)
 
-        loss = F.cross_entropy(logits, labels)
+        # ----- Extra negatives from the queue -----
+        with torch.no_grad():
+            queue_img = self.image_queue.clone().detach()
+            queue_txt = self.text_queue.clone().detach()
+
+        # Each image contrasts also with text negatives from queue
+        logits_img_queue = image_features @ queue_txt.t() * T
+        logits_txt_queue = text_features @ queue_img.t() * T
+
+        # Concatenate in-batch + queue negatives
+        logits_i2t = torch.cat([logits_img2txt, logits_img_queue], dim=1)
+        logits_t2i = torch.cat([logits_img2txt.t(), logits_txt_queue], dim=1)
+
+        loss_i2t = F.cross_entropy(logits_i2t, labels)
+        loss_t2i = F.cross_entropy(logits_t2i, labels)
+        loss = 0.5 * (loss_i2t + loss_t2i)
+
+        # ----- Momentum update + enqueue -----
+        if (image_encoder is not None) and (text_encoder is not None):
+            if self.image_encoder_m is None:
+                # Initialize momentum encoders on first call
+                import copy
+                self.image_encoder_m = copy.deepcopy(image_encoder)
+                self.text_encoder_m = copy.deepcopy(text_encoder)
+                for p in self.image_encoder_m.parameters():
+                    p.requires_grad = False
+                for p in self.text_encoder_m.parameters():
+                    p.requires_grad = False
+
+            with torch.no_grad():
+                self._momentum_update(image_encoder, self.image_encoder_m)
+                self._momentum_update(text_encoder,  self.text_encoder_m)
+                img_keys = self.image_encoder_m().detach()
+                txt_keys = self.text_encoder_m().detach()
+                self._dequeue_and_enqueue(img_keys, txt_keys)
 
         return loss
     
 class PromptLearner(nn.Module):
     def __init__(self, 
                  text_tokenizer,
+                 token_embedding,
                  num_prompt_tokens, 
                  embedding_dim, 
                  class_names: List[str],
@@ -90,11 +141,6 @@ class PromptLearner(nn.Module):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
-
-        # Initialize the learnable prompt vectors
-        prompt_vectors = torch.empty(len(class_names), num_prompt_tokens, embedding_dim)
-        nn.init.normal_(prompt_vectors, std=0.02) # Standard initialization
-        self.prompt = nn.Parameter(prompt_vectors)
 
         # Store tokenized class names
         self.class_names = class_names
@@ -113,13 +159,17 @@ class PromptLearner(nn.Module):
         self.register_buffer("text_inputs", text_inputs)
         self.register_buffer("ai_text_inputs", ai_text_inputs)
 
-    def forward(self, text_model):
         with torch.no_grad():
-            emb_layer = text_model.get_input_embeddings()
-            # Get the standard word embeddings for class names
-            class_name_embs = emb_layer(self.text_inputs.to(self.prompt.device))
-            ai_prompt_embs = emb_layer(self.ai_text_inputs.to(self.prompt.device))
+            class_embedding = token_embedding(text_inputs)
+            ai_text_embedding = token_embedding(ai_text_inputs)[:, 1:, :]
         
+        # Initialize the learnable prompt vectors
+        self.prompt = nn.Parameter(ai_text_embedding)
+
+        self.register_buffer("class_name_embedding", class_embedding)
+        self.register_buffer("ai_text_embedding", ai_text_embedding)
+
+    def forward(self, text_model):
         # --- Mix the AI-generated and learnable prompts ---
         # prompt: (N, P, D)
         # ai_prompt_embs: (N, L, D)
@@ -127,8 +177,7 @@ class PromptLearner(nn.Module):
 
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
-        mixed_prompt = ai_prompt_embs[:, 1:1+self.num_prompt_tokens, :] + self.prompt
-        combined_embs = torch.cat([mixed_prompt, class_name_embs], dim=1)
+        combined_embs = torch.cat([self.prompt, self.class_name_embedding], dim=1)
         
         # Pass the combined embeddings through the rest of the text encoder
         # This part requires a custom forward pass through the text model layers
@@ -269,6 +318,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
 
         prompt_learner = PromptLearner(
             text_tokenizer=text_tokenizer,
+            token_embedding=frozen_text_model.get_input_embeddings(),
             num_prompt_tokens=N_PROMPT_TOKEN,
             embedding_dim=embedding_dim,
             class_names=class_names,
@@ -277,7 +327,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
         prompt_learners.append(prompt_learner)
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
-    sup_con_loss = SupervisedSigmoidLoss().to(device)
+    sup_con_loss = MoCoInfoNCELoss(embedding_dim).to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
@@ -344,8 +394,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
                 modified_text_embeddings = prompt_learners[i](lora_model.text_model)[0]
                 text_features = modified_text_embeddings[label_batch]
                 
-                loss = sup_con_loss(text_features, image_features_batch, label_batch) + \
-                        sup_con_loss(image_features_batch, text_features, label_batch)
+                loss = sup_con_loss(image_features_batch, text_features)
                 loss_align = 1.0 - F.cosine_similarity(
                                         text_features, frozen_text_features.detach(), dim=1
                                         ).mean()
