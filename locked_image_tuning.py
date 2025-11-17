@@ -2,7 +2,6 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from evaluation import R1_mAP_eval_pt
 
 import transformers
 import torch
@@ -182,22 +181,24 @@ class PromptLearner(nn.Module):
         self.register_buffer("text_inputs", text_inputs)
         self.register_buffer("ai_text_inputs", ai_text_inputs)
 
+        # add positional embedding
         with torch.no_grad():
             class_embedding = token_embedding(text_inputs)
             ai_text_embedding = token_embedding(ai_text_inputs)[:, 1:, :]
         
         # Initialize the learnable prompt vectors
-        self.prompt = nn.Parameter(ai_text_embedding)
+        self.prompt = nn.Parameter(ai_text_embedding).to(device)
 
         self.register_buffer("class_name_embedding", class_embedding)
         self.register_buffer("ai_text_embedding", ai_text_embedding)
 
-    def forward(self, text_model):
+    def forward(self, text_model, domain_ids=None):
         # --- Mix the AI-generated and learnable prompts ---
         # prompt: (N, P, D)
         # ai_prompt_embs: (N, L, D)
         # class_name_embs: (N, L', D)
-
+        if isinstance(domain_ids, int):
+            domain_ids = torch.ones((self.prompt.size(0),), dtype=torch.long, device=self.prompt.device) * domain_ids
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
         combined_embs = torch.cat([self.prompt, self.class_name_embedding], dim=1)
@@ -210,7 +211,7 @@ class PromptLearner(nn.Module):
         # A simplified representation of passing through the encoder:
         # Note: The actual `transformers` implementation requires passing embeddings
         # through `model.text_model.encoder` and then `model.text_model.final_layer_norm`.
-        prompted_text_features, prompted_text_hidden_state = text_model(inputs_embeds=combined_embs)
+        prompted_text_features, prompted_text_hidden_state = text_model(inputs_embeds=combined_embs, domain_ids=domain_ids)
         
         return prompted_text_features, prompted_text_hidden_state
 
@@ -320,7 +321,8 @@ def LoRA_tuning_variable_dataset(dataset_names,
         lora_dropout=0.1,
         bias="none",
         use_dora=True,
-        init_lora_weights="pissa_niter_4"
+        init_lora_weights="pissa_niter_4",
+        modules_to_save=["domain_embedding"]
     )
     frozen_text_model = copy.deepcopy(base_model.text_model).to(device)
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
@@ -347,7 +349,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
             device=device,
             class_names=class_names,
             init_prompts=ai_prompts
-        ).to(device)
+        )
         prompt_learners.append(prompt_learner)
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
@@ -370,19 +372,23 @@ def LoRA_tuning_variable_dataset(dataset_names,
     
     # --- Pre-extract image features for all datasets ---
     image_features_lists = []
+    image_hidden_state_lists = []
     image_label_lists = []
     with torch.inference_mode():
         for i, train_dataloader in enumerate(train_dataloaders):
             image_features_list = []
+            image_hidden_state_list = []
             image_label_list = []
             for batch in train_dataloader:
                 image_tensor, label = batch[:2]
                 image_tensor = image_tensor.to(device)
                 label = label.to(device)
-                image_features = lora_model.get_image_features(image_tensor)[0]
+                image_features, image_last_hidden_state = lora_model.get_image_features(image_tensor)
                 image_features_list.append(image_features)
+                image_hidden_state_list.append(image_last_hidden_state)
                 image_label_list.append(label)
             image_features_lists.append(torch.cat(image_features_list, dim=0).to(device))
+            image_hidden_state_lists.append(torch.cat(image_hidden_state_list, dim=0).to(device))
             image_label_lists.append(torch.cat(image_label_list, dim=0))
 
     # --- Samplers for each dataset ---
@@ -409,20 +415,18 @@ def LoRA_tuning_variable_dataset(dataset_names,
             indices_batch, label_batch = next(sampler_iter)
             
             image_features_batch = image_features_lists[i][indices_batch]
+            image_hidden_state_batch = image_hidden_state_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
+            domain_batch = i % 1
 
             with autocast(device):
-                with torch.no_grad():
-                    frozen_modified_text_embeddings = prompt_learners[i](frozen_text_model)[0]
-                    frozen_text_features = frozen_modified_text_embeddings[label_batch]
-                modified_text_embeddings = prompt_learners[i](lora_model.text_model)[0]
+                modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
+                text_hidden_state = modified_text_hidden_states[label_batch]
                 
-                loss = sup_con_loss(image_features_batch, text_features, label_batch)
-                loss_align = 1.0 - F.cosine_similarity(
-                                        text_features, frozen_text_features.detach(), dim=1
-                                        ).mean()
-                total_loss += loss + 0.1 * loss_align
+                loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
+                        0.25 * sup_con_loss(image_hidden_state_batch, text_hidden_state, label_batch)
+                total_loss += loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)

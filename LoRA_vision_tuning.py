@@ -135,19 +135,6 @@ class MoCoInfoNCELoss(nn.Module):
         return loss
 
 
-class GeMPooling(nn.Module):
-    def __init__(self, p=1.0, eps=1e-6, trainable=True):
-        super().__init__()
-        self.p = nn.Parameter(torch.ones(1) * p) if trainable else p
-        self.eps = eps
-
-    def forward(self, x):
-        # x: [B, N, D]
-        p = self.p.clamp(1.0, 6.0)
-        x = x.clamp(min=self.eps).pow(p)
-        x = x.mean(dim=1).pow(1.0 / p)
-        return x
-
 def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, reg_weight=0.1):
     """
     Hard triplet mining with flexible, regularized adaptive margin.
@@ -212,6 +199,7 @@ def LoRA_vision_tuning(
             
         ).to(device)
         classifier[0].bias.requires_grad_(False)
+        nn.init.normal_(classifier[1].weight, std=0.001)
         classifiers.append(classifier)
         
         # Add its parameters to the list
@@ -258,7 +246,6 @@ def LoRA_vision_tuning(
     # This creates the *new* trainable LoRA parameters
     vision_model = get_peft_model(base_model.vision_model, lora_config)
     vision_model.print_trainable_parameters()
-    gem_pooling = GeMPooling().to(device)
     vision_model = vision_model.to(device)
 
     # --- 4. NOW Create the Optimizer ---
@@ -268,7 +255,7 @@ def LoRA_vision_tuning(
     optimizer = torch.optim.Adam(
         [
             {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-3, 'weight_decay': 1e-4},           # Group 1: LoRA params
-            {'params': classifier_params + list(gem_pooling.parameters()), 'lr': 5e-3, 'weight_decay': 1e-4}    # Group 2: Classifier params
+            {'params': classifier_params, 'lr': 5e-3, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
     # --- 5. Schedulers and Losses ---
@@ -294,12 +281,12 @@ def LoRA_vision_tuning(
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
     modified_text_hidden_states = []
-    for prompt_learner in prompt_learners:
+    for i, prompt_learner in enumerate(prompt_learners):
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
         with torch.no_grad():
-            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model)
+            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model, i % 1)
             modified_text_embeddings.append(modified_text_embedding)
             modified_text_hidden_states.append(modified_text_hidden_state)
 
@@ -308,7 +295,6 @@ def LoRA_vision_tuning(
 
     def fwd(x, y=None):
         image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False, domain_id=y)
-        last_hidden_state = gem_pooling(last_hidden_state)
         return image_features, last_hidden_state
     
     for epoch in range(N_EPOCHS_VISION):
