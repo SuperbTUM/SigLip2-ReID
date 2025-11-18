@@ -216,7 +216,6 @@ def LoRA_vision_tuning(
     text_model = text_model.to(device)
 
     # --- 3. Apply PEFT to the Vision Model ---
-    base_model.vision_model.vision_model.embeddings.domain_embedding.weight.data.normal_(mean=0.0, std=0.02)
     base_model.vision_model = base_model.vision_model.train()
     if adalora:
         lora_config = AdaLoraConfig(
@@ -294,7 +293,7 @@ def LoRA_vision_tuning(
     accumulation_steps = 2  # Adjust as needed
 
     def fwd(x, y=None):
-        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False, domain_id=y)
+        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False, domain_ids=y)
         return image_features, last_hidden_state
     
     for epoch in range(N_EPOCHS_VISION):
@@ -314,13 +313,13 @@ def LoRA_vision_tuning(
             label = label.to(device)
 
             with autocast(device, torch.float16):
-                image_features, last_hidden_state = checkpoint(fwd, image_tensor, torch.zeros_like(label) if (i%1) else torch.ones_like(label), use_reentrant=False)
+                image_features, last_hidden_state = checkpoint(fwd, image_tensor, torch.ones_like(label) * i, use_reentrant=False)
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
                 loss_ce = criterion[i](logits, label)
 
-                image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, torch.zeros_like(label) if (i%1) else torch.ones_like(label), use_reentrant=False)
+                image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, torch.ones_like(label) * i, use_reentrant=False)
                 
                 # Sigmoid loss
                 with torch.no_grad():

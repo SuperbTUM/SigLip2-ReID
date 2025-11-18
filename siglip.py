@@ -37,11 +37,11 @@ def _prepare_4d_attention_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: 
         return bool_mask.expand(batch, 1, tgt_len, src_len)
 
 
-def norm_softmax_pooling(hidden_states, alpha=1.0):
-    # hidden_states: [B, N, D]
-    norms = hidden_states.norm(dim=-1)        # [B, N]
-    weights = torch.softmax(alpha * norms, dim=-1)
-    return (weights.unsqueeze(-1) * hidden_states).sum(dim=1)
+def norm_weighted_pool(x, eps=1e-6):
+    # x: (B, T, C)
+    w = x.norm(dim=-1, keepdim=True)          # (B, T, 1)
+    w = w / (w.sum(dim=1, keepdim=True) + eps)
+    return (x * w).sum(dim=1)                  # (B, C)
 
 
 class SiglipvisionConfig:
@@ -500,7 +500,7 @@ class SiglipVisionModel(nn.Module):
                                                              spatial_shapes=spatial_shapes)
         if domain_ids is not None:
             pooler_output = pooler_output + self.domain_embedding(domain_ids)
-        last_hidden_state = norm_softmax_pooling(last_hidden_state)
+        last_hidden_state = norm_weighted_pool(last_hidden_state)
         return pooler_output, last_hidden_state
 
 
@@ -713,7 +713,7 @@ class SiglipTextModel(nn.Module):
         )
         if domain_ids is not None:
             pooler_output = pooler_output + self.domain_embedding(domain_ids)
-        last_hidden_state = norm_softmax_pooling(last_hidden_state)
+        last_hidden_state = norm_weighted_pool(last_hidden_state)
         return pooler_output, last_hidden_state
 
 

@@ -383,6 +383,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
                 image_tensor, label = batch[:2]
                 image_tensor = image_tensor.to(device)
                 label = label.to(device)
+                # domain_ids = torch.ones_like(label) * i
                 image_features, image_last_hidden_state = lora_model.get_image_features(image_tensor)
                 image_features_list.append(image_features)
                 image_hidden_state_list.append(image_last_hidden_state)
