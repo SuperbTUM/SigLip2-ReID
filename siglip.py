@@ -686,7 +686,7 @@ class SiglipTextModel(nn.Module):
         super().__init__()
         self.text_model = Siglip2TextTransformer(config)
         self.domain_embedding = nn.Embedding(config.num_domains, config.hidden_size)
-        nn.init.normal_(self.domain_embedding.weight.data, std=0.02)
+        nn.init.normal_(self.domain_embedding.weight.data, std=0.0001)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.text_model.embeddings.token_embedding
