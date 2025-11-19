@@ -490,7 +490,7 @@ class SiglipVisionModel(nn.Module):
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
         self.domain_embedding = nn.Embedding(config.num_domains, config.hidden_size)
-        nn.init.normal_(self.domain_embedding.weight.data, std=0.02)
+        nn.init.normal_(self.domain_embedding.weight.data, std=0.0001)
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool, domain_ids: torch.Tensor = None) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
@@ -594,15 +594,18 @@ class SiglipTextEmbeddings(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(config.max_position_embeddings, embed_dim)
+        self.domain_embedding = nn.Embedding(config.num_domains, embed_dim)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.register_buffer(
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
         )
+        nn.init.normal_(self.domain_embedding.weight.data, std=0.02)
 
     def forward(
             self,
-            input_ids
+            input_ids,
+            domain_ids=None
     ) -> torch.Tensor:
         seq_length = input_ids.shape[-1]
         max_position_embedding = self.position_embedding.weight.shape[0]
@@ -618,6 +621,8 @@ class SiglipTextEmbeddings(nn.Module):
 
         position_embeddings = self.position_embedding(position_ids)
         embeddings = inputs_embeds + position_embeddings
+        if domain_ids is not None:
+            embeddings = embeddings + self.domain_embedding(domain_ids)[:, None, :]
 
         return embeddings
 
@@ -641,7 +646,8 @@ class Siglip2TextTransformer(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            inputs_embeds: Optional[torch.Tensor] = None
+            inputs_embeds: Optional[torch.Tensor] = None,
+            domain_ids: Optional[torch.Tensor] = None
     ):
         r"""
         Returns:
@@ -654,10 +660,12 @@ class Siglip2TextTransformer(nn.Module):
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
             # Default path: get embeddings from token IDs
-            hidden_states = self.embeddings(input_ids=input_ids)
+            hidden_states = self.embeddings(input_ids=input_ids, domain_ids=domain_ids)
         elif inputs_embeds is not None:
             # Prompt learning path: use the provided embeddings directly
             hidden_states = inputs_embeds
+            if domain_ids is not None:
+                hidden_states = hidden_states + self.get_input_embeddings().domain_embedding(domain_ids)[:, None, :]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
@@ -685,11 +693,9 @@ class SiglipTextModel(nn.Module):
     def __init__(self, config: SiglipTextConfig):
         super().__init__()
         self.text_model = Siglip2TextTransformer(config)
-        self.domain_embedding = nn.Embedding(config.num_domains, config.hidden_size)
-        nn.init.normal_(self.domain_embedding.weight.data, std=0.0001)
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.text_model.embeddings.token_embedding
+        return self.text_model.embeddings
 
     def set_input_embeddings(self, value):
         self.text_model.embeddings.token_embedding = value
@@ -709,10 +715,9 @@ class SiglipTextModel(nn.Module):
         pooler_output, last_hidden_state = self.text_model(
                                             input_ids=input_ids,
                                             attention_mask=attention_mask,
-                                            inputs_embeds=inputs_embeds
+                                            inputs_embeds=inputs_embeds,
+                                            domain_ids=domain_ids
         )
-        if domain_ids is not None:
-            pooler_output = pooler_output + self.domain_embedding(domain_ids)
         last_hidden_state = norm_weighted_pool(last_hidden_state)
         return pooler_output, last_hidden_state
 

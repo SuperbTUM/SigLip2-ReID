@@ -324,7 +324,6 @@ def LoRA_tuning_variable_dataset(dataset_names,
         init_lora_weights="pissa_niter_4",
         modules_to_save=["domain_embedding"]
     )
-    frozen_text_model = copy.deepcopy(base_model.text_model).to(device)
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
     lora_model = base_model.to(device)
     embedding_dim = lora_model.config.text_config.hidden_size
@@ -343,7 +342,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
 
         prompt_learner = PromptLearner(
             text_tokenizer=text_tokenizer,
-            token_embedding=frozen_text_model.get_input_embeddings(),
+            token_embedding=lora_model.text_model.get_input_embeddings(),
             num_prompt_tokens=N_PROMPT_TOKEN,
             embedding_dim=embedding_dim,
             device=device,
