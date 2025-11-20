@@ -420,7 +420,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
             domain_batch = i % 1
 
             with autocast(device):
-                modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model, domain_batch)
+                modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model) #, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
                 text_hidden_state = modified_text_hidden_states[label_batch]
                 

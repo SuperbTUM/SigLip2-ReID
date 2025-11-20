@@ -285,7 +285,7 @@ def LoRA_vision_tuning(
             param.requires_grad = False
         prompt_learner.eval()
         with torch.no_grad():
-            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model, i % 1)
+            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model) #, i % 1)
             modified_text_embeddings.append(modified_text_embedding)
             modified_text_hidden_states.append(modified_text_hidden_state)
 
