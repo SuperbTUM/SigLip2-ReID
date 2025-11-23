@@ -239,8 +239,7 @@ def LoRA_vision_tuning(
             target_modules=["q_proj", "v_proj", "out_proj", "k_proj"], # Experiment
             lora_dropout=0.1,
             use_dora=True,
-            init_lora_weights="eva",
-            modules_to_save=["domain_embedding"]
+            init_lora_weights="eva"
         )
     # This creates the *new* trainable LoRA parameters
     vision_model = get_peft_model(base_model.vision_model, lora_config)
@@ -267,14 +266,14 @@ def LoRA_vision_tuning(
             lr_factor = start_lr / base_lr + (1 - start_lr / base_lr) * (epoch / warmup_epochs)
             return lr_factor
 
-    # warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-4, base_lr=5e-3))
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-4, base_lr=5e-3))
+    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
 
-    # scheduler = torch.optim.lr_scheduler.SequentialLR(
-    #     optimizer,
-    #     schedulers=[warmup_scheduler, multistep_scheduler],
-    #     milestones=[5]
-    # )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, multistep_scheduler],
+        milestones=[5]
+    )
     criterion = [nn.CrossEntropyLoss(label_smoothing=0.05).to(device), nn.CrossEntropyLoss(label_smoothing=0.1).to(device)]
 
     # --- Freeze prompt learners ---
@@ -285,15 +284,15 @@ def LoRA_vision_tuning(
             param.requires_grad = False
         prompt_learner.eval()
         with torch.no_grad():
-            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model) #, i % 1)
+            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model, i % 1)
             modified_text_embeddings.append(modified_text_embedding)
             modified_text_hidden_states.append(modified_text_hidden_state)
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
 
-    def fwd(x, y=None):
-        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False, domain_ids=y)
+    def fwd(x):
+        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False)
         return image_features, last_hidden_state
     
     for epoch in range(N_EPOCHS_VISION):

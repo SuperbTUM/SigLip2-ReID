@@ -192,7 +192,7 @@ class PromptLearner(nn.Module):
         self.register_buffer("class_name_embedding", class_embedding)
         self.register_buffer("ai_text_embedding", ai_text_embedding)
 
-    def forward(self, text_model, domain_ids=None):
+    def forward(self, text_model, domain_ids):
         # --- Mix the AI-generated and learnable prompts ---
         # prompt: (N, P, D)
         # ai_prompt_embs: (N, L, D)
@@ -321,8 +321,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
         lora_dropout=0.1,
         bias="none",
         use_dora=True,
-        init_lora_weights="pissa_niter_4",
-        modules_to_save=["domain_embedding"]
+        init_lora_weights="pissa_niter_4"
     )
     base_model.text_model = get_peft_model(base_model.text_model, lora_config)
     lora_model = base_model.to(device)
@@ -332,6 +331,10 @@ def LoRA_tuning_variable_dataset(dataset_names,
     train_dataloaders = []
     prompt_learners = []
     all_trainable_params = list(lora_model.parameters())
+    for name, m in lora_model.text_model.named_modules():
+        if "dal" in name.lower():
+            for p in m.parameters():
+                p.requires_grad = True
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
         train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True)
@@ -420,7 +423,7 @@ def LoRA_tuning_variable_dataset(dataset_names,
             domain_batch = i % 1
 
             with autocast(device):
-                modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model) #, domain_batch)
+                modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
                 text_hidden_state = modified_text_hidden_states[label_batch]
                 

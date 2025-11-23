@@ -4,6 +4,65 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
+class DAL(nn.Module):
+    """
+    Domain Adaptation Layer (DAL)
+    LN -> Linear -> GELU -> Linear -> LN
+    Outputs same dimension as input.
+    """
+    def __init__(self, num_domains, hidden_size, mlp_ratio=2.0, dropout=0.0):
+        super().__init__()
+        inner = int(hidden_size * mlp_ratio)
+        self.domain_embedding = nn.Embedding(num_domains, hidden_size)
+
+        # FiLM parameters
+        self.gamma = nn.Linear(hidden_size, hidden_size)
+        self.beta = nn.Linear(hidden_size, hidden_size)
+
+        self.ln1 = nn.LayerNorm(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, inner)
+        self.fc2 = nn.Linear(inner, hidden_size)
+        self.ln2 = nn.LayerNorm(hidden_size)
+        self.drop = nn.Dropout(dropout)
+    
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Domain embedding: small, but not tiny (0.01 is correct for mid-layer DAL)
+        nn.init.normal_(self.domain_embedding.weight, std=0.01)
+
+        # FiLM starts as identity transformation:
+        # x * (1 + 0) + 0 == x
+        nn.init.zeros_(self.gamma.weight)
+        nn.init.zeros_(self.gamma.bias)
+
+        nn.init.zeros_(self.beta.weight)
+        nn.init.zeros_(self.beta.bias)
+
+        # MLP inside DAL should start as near-zero residual
+        # so DAL behaves like identity initially
+        nn.init.xavier_uniform_(self.fc1.weight, gain=0.1)
+        nn.init.zeros_(self.fc1.bias)
+
+        nn.init.xavier_uniform_(self.fc2.weight, gain=0.1)
+        nn.init.zeros_(self.fc2.bias)
+
+        # LayerNorm is fine with default initialization
+
+    def forward(self, x, domain_ids):
+        # x: (B, D)
+        dtype = x.dtype
+        d = self.domain_embedding(domain_ids).to(dtype).unsqueeze(1)
+        gx = self.gamma(d)
+        bx = self.beta(d)
+        x = x * (1 + gx) + bx
+        h = self.ln1(x)
+        h = self.fc1(h)
+        h = F.gelu(h)
+        h = self.drop(h)
+        h = self.fc2(h)
+        return self.ln2(h + x)  # residual
+
 def _prepare_4d_attention_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Creates a non-causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
@@ -489,17 +548,13 @@ class SiglipVisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
-        self.domain_embedding = nn.Embedding(config.num_domains, config.hidden_size)
-        nn.init.normal_(self.domain_embedding.weight.data, std=0.0001)
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool, domain_ids: torch.Tensor = None) -> Tuple:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
         bs, _, h, w = pixel_values.shape
         spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
         pooler_output, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
                                                              spatial_shapes=spatial_shapes)
-        if domain_ids is not None:
-            pooler_output = pooler_output + self.domain_embedding(domain_ids)
         last_hidden_state = norm_weighted_pool(last_hidden_state)
         return pooler_output, last_hidden_state
 
@@ -594,18 +649,16 @@ class SiglipTextEmbeddings(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(config.max_position_embeddings, embed_dim)
-        self.domain_embedding = nn.Embedding(config.num_domains, embed_dim)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.register_buffer(
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
         )
-        nn.init.normal_(self.domain_embedding.weight.data, std=0.02)
+        
 
     def forward(
             self,
-            input_ids,
-            domain_ids=None
+            input_ids
     ) -> torch.Tensor:
         seq_length = input_ids.shape[-1]
         max_position_embedding = self.position_embedding.weight.shape[0]
@@ -621,8 +674,6 @@ class SiglipTextEmbeddings(nn.Module):
 
         position_embeddings = self.position_embedding(position_ids)
         embeddings = inputs_embeds + position_embeddings
-        if domain_ids is not None:
-            embeddings = embeddings + self.domain_embedding(domain_ids)[:, None, :]
 
         return embeddings
 
@@ -638,6 +689,8 @@ class Siglip2TextTransformer(nn.Module):
 
         self.head = nn.Linear(embed_dim, config.projection_size)
         self._use_flash_attention_2 = False
+        
+        self.dal = DAL(config.num_domains, embed_dim)
     
     def get_input_embeddings(self) -> nn.Module:
         return self.embeddings
@@ -660,12 +713,10 @@ class Siglip2TextTransformer(nn.Module):
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
             # Default path: get embeddings from token IDs
-            hidden_states = self.embeddings(input_ids=input_ids, domain_ids=domain_ids)
+            hidden_states = self.embeddings(input_ids=input_ids)
         elif inputs_embeds is not None:
             # Prompt learning path: use the provided embeddings directly
             hidden_states = inputs_embeds
-            if domain_ids is not None:
-                hidden_states = hidden_states + self.get_input_embeddings().domain_embedding(domain_ids)[:, None, :]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
@@ -681,6 +732,7 @@ class Siglip2TextTransformer(nn.Module):
         )
 
         last_hidden_state = self.final_layer_norm(last_hidden_state)
+        last_hidden_state = self.dal(last_hidden_state, domain_ids)
 
         # Assuming "sticky" EOS tokenization, last token is always EOS.
         pooled_output = last_hidden_state[:, -1, :]
@@ -814,8 +866,7 @@ class SiglipModel(nn.Module):
     def get_image_features(
             self,
             pixel_values: Optional[torch.FloatTensor] = None,
-            interpolate_pos_encoding: bool = False,
-            domain_ids: Optional[torch.Tensor] = None,
+            interpolate_pos_encoding: bool = False
     ) -> torch.FloatTensor:
         r"""
         Returns:
@@ -827,8 +878,7 @@ class SiglipModel(nn.Module):
 
         pooled_output, last_hidden_state = self.vision_model(
             pixel_values=pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-            domain_ids=domain_ids
+            interpolate_pos_encoding=interpolate_pos_encoding
         )
 
         return pooled_output, last_hidden_state
