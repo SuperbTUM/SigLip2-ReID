@@ -3,7 +3,7 @@ from constants import *
 from data_preparation import *
 from checkpoint import *
 from evaluation import R1_mAP_eval_pt
-from locked_image_tuning import LoRA_tuning_variable_dataset
+from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
 import torch
 import torch.nn as nn
@@ -196,7 +196,6 @@ def LoRA_vision_tuning(
         classifier = nn.Sequential(
             nn.BatchNorm1d(embedding_dim),
             nn.Linear(embedding_dim, n_cls, bias=False),
-            
         ).to(device)
         classifier[0].bias.requires_grad_(False)
         nn.init.normal_(classifier[1].weight, std=0.001)
@@ -379,7 +378,8 @@ if __name__ == "__main__":
     class_names_list = ["person", "vehicle"]
     
     # Get the pre-tuned base model and prompt learners from locked image tuning
-    base_model, prompt_learners, temperature = LoRA_tuning_variable_dataset(dataset_names, input_sizes, class_names_list, DEVICE)
+    base_model = tuning_vision_projection(dataset_names, input_sizes, class_names_list, DEVICE)
+    base_model, prompt_learners, temperature = LoRA_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
 
     # Run LoRA vision tuning
     model = LoRA_vision_tuning(base_model, prompt_learners, temperature, dataset_names, input_sizes, DEVICE)
