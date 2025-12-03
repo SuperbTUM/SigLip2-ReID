@@ -26,7 +26,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class MoCoInfoNCELoss(nn.Module):
     def __init__(self, 
                  feature_dim: int, 
-                 queue_size: int = 32,
+                 queue_size: int = 64,
                  momentum: float = 0.999,
                  temperature: float = 0.07):
         super().__init__()

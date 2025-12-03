@@ -20,7 +20,7 @@ class SupConLoss(nn.Module):
     def __init__(self, device):
         super(SupConLoss, self).__init__()
         self.device = device
-        self.temperature = nn.Parameter(torch.log(torch.tensor(1.0, device=device)))
+        self.temperature = nn.Parameter(torch.log(torch.tensor(0.07, device=device)))
 
     def forward(self, text_features, image_features, t_label, i_targets):
         temperature = self.temperature.exp().clamp(0.01, 10.0)
@@ -53,7 +53,7 @@ class SupConLoss(nn.Module):
 class MoCoInfoNCELoss(nn.Module):
     def __init__(self, 
                  feature_dim: int, 
-                 queue_size: int = 32,
+                 queue_size: int = 64,
                  momentum: float = 0.999,
                  temperature: float = 0.07):
         super().__init__()
@@ -322,10 +322,18 @@ def tuning_vision_projection(dataset_names,
                              device):
     base_model = model.load_weights(MODEL_NAME)
     base_model.train()
-    for param in base_model.parameters():
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.1,
+        bias="none",
+        use_dora=True,
+        init_lora_weights="pissa_niter_4"
+    )
+    base_model.vision_model = get_peft_model(base_model.vision_model, lora_config)
+    for param in base_model.text_model.parameters():
         param.requires_grad = False
-    for param in base_model.vision_model.vision_model.head.parameters():
-        param.requires_grad = True
     base_model = base_model.to(device)
     all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters()))
 
@@ -348,59 +356,32 @@ def tuning_vision_projection(dataset_names,
     )
     train_dataloaders = []
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
-        train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True)
+        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False)
         train_dataloaders.append(train_dataloader)
-
-        # --- Pre-extract image features for all datasets ---
-    image_hidden_state_lists = []
-    image_hidden_state_pooled_lists = []
-    image_label_lists = []
-    with torch.inference_mode():
-        for i, train_dataloader in enumerate(train_dataloaders):
-            image_hidden_state_list = []
-            image_hidden_state_pooled_list = []
-            image_label_list = []
-            for batch in train_dataloader:
-                image_tensor, label = batch[:2]
-                image_tensor = image_tensor.to(device)
-                label = label.to(device)
-                image_last_hidden_state, image_last_hidden_state_pooled = base_model.vision_model.get_last_hidden_state(image_tensor, False)
-                image_hidden_state_list.append(image_last_hidden_state.cpu().half())  # CPU + FP16
-                image_hidden_state_pooled_list.append(image_last_hidden_state_pooled.cpu())
-                image_label_list.append(label.cpu())
-            image_hidden_state_lists.append(torch.cat(image_hidden_state_list, dim=0))
-            image_hidden_state_pooled_lists.append(torch.cat(image_hidden_state_pooled_list, dim=0))
-            image_label_lists.append(torch.cat(image_label_list, dim=0))
-
-    # --- Samplers for each dataset ---
-    pk_samplers = [
-        PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
-        for labels in image_label_lists
-    ]
     
     # --- Training Loop ---
-    # Use itertools.cycle to handle datasets of different sizes
-    num_batches = max(len(sampler) for sampler in pk_samplers)
-    # Create cyclic iterators
-    sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
+    num_batches = max(len(loader) for loader in train_dataloaders)
+    
 
     for epoch in range(N_EPOCHS_PRESTAGE):
         loss_by_epoch = 0
+        dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
+        round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
         
-        for step, (i, sampler_iter) in enumerate(itertools.cycle(enumerate(sampler_iters))):
-            if step >= num_batches:  # stop after desired batches
-                break
+        for batch_idx in range(num_batches):
+
+            i, dataloader_iter = next(round_robin_iter)
+
+            image_tensor, label_batch = next(dataloader_iter)[:2]
+
             optimizer.zero_grad()
             total_loss = 0
 
-            indices_batch, label_batch = next(sampler_iter)
-            
-            image_hidden_state_batch = image_hidden_state_lists[i][indices_batch].to(device)
-            label_batch = torch.tensor(label_batch, device=device)
+            label_batch = label_batch.to(device)
             domain_batch = i % 1
 
             with autocast(device):
-                image_features_batch = base_model.vision_model.vision_model.get_pooler_output_by_hidden_state(image_hidden_state_batch)
+                image_features_batch = base_model.get_image_features(image_tensor.to(device))[0]
 
                 image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch)
                 loss = image_contrastive_loss
@@ -413,6 +394,7 @@ def tuning_vision_projection(dataset_names,
         scheduler.step()
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
+    base_model.vision_model = base_model.vision_model.merge_and_unload()
     return base_model.eval()
 
 
