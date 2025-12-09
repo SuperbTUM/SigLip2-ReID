@@ -2,6 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
+from losses import SupConLoss, MaxSimInfoNCE, MoCoInfoNCELoss
 
 import transformers
 import torch
@@ -16,152 +17,6 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-class SupConLoss(nn.Module):
-    def __init__(self, device):
-        super(SupConLoss, self).__init__()
-        self.device = device
-        self.temperature = nn.Parameter(torch.log(torch.tensor(0.07, device=device)))
-
-    def forward(self, text_features, image_features, t_label, i_targets):
-        temperature = self.temperature.exp().clamp(0.01, 10.0)
-        text_features = F.normalize(text_features)
-        image_features = F.normalize(image_features)
-
-        batch_size = text_features.shape[0]
-        batch_size_N = image_features.shape[0]
-        mask = torch.eq(t_label.unsqueeze(1).expand(batch_size, batch_size_N), \
-            i_targets.unsqueeze(0).expand(batch_size,batch_size_N)).float().to(self.device)
-
-        logits = torch.div(torch.matmul(text_features, image_features.T), temperature)
-        logits_mask = torch.scatter(
-            torch.ones_like(mask), 
-            1, 
-            torch.arange(batch_size).view(-1, 1).to(self.device), 
-            0
-        )
-        mask = mask * logits_mask
-        # for numerical stability
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
-        loss = - mean_log_prob_pos.mean()
-
-        return loss
-
-class MoCoInfoNCELoss(nn.Module):
-    def __init__(self, 
-                 feature_dim: int, 
-                 queue_size: int = 64,
-                 momentum: float = 0.999,
-                 temperature: float = 0.07):
-        super().__init__()
-        self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
-        self.queue_size = queue_size
-        self.momentum = momentum
-
-        # --- Queues ---
-        self.register_buffer("image_queue", torch.randn(queue_size, feature_dim))
-        self.register_buffer("text_queue", torch.randn(queue_size, feature_dim))
-        self.register_buffer("queue_pids", torch.zeros(queue_size, dtype=torch.long))
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-        # --- Optional momentum encoders ---
-        self.image_encoder_m = None
-        self.text_encoder_m = None
-
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys_img, keys_txt, pids):
-        batch_size = keys_txt.size(0)
-        ptr = int(self.queue_ptr)
-        assert self.queue_size % batch_size == 0
-        self.image_queue[ptr:ptr+batch_size, :] = keys_img
-        self.text_queue[ptr:ptr+batch_size, :] = keys_txt
-        self.queue_pids[ptr:ptr+batch_size] = pids
-        self.queue_ptr[0] = (ptr + batch_size) % self.queue_size
-
-    @torch.no_grad()
-    def _momentum_update(self, model, model_m):
-        for param_q, param_k in zip(model.parameters(), model_m.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
-
-    def forward(
-        self,
-        image_features,             # precomputed image embeddings [B,D]
-        text_features,              # precomputed text embeddings [B,D]
-        pid_labels=None,            # batch IDs
-        image_encoder=None,         # optional main image encoder for momentum
-        image_inputs=None,          # optional raw image input for momentum
-        text_encoder=None,          # optional main text encoder for momentum
-        text_inputs=None            # optional raw text input for momentum
-    ):
-        # --- Temperature ---
-        T = self.temperature.exp().clamp(0.01, 10.0)
-
-        # --- In-batch logits (no normalization) ---
-        logits_i2t = image_features @ text_features.t() * T
-        logits_t2i = logits_i2t.t().clone()
-        labels = torch.arange(logits_i2t.size(0), device=image_features.device)
-
-        same_id_mask_inbatch = pid_labels.unsqueeze(1) == pid_labels.unsqueeze(0)
-        same_id_mask_inbatch.fill_diagonal_(False)  # allow self-positive
-        logits_i2t = logits_i2t.masked_fill(same_id_mask_inbatch, torch.finfo(logits_i2t.dtype).min)
-        logits_t2i = logits_t2i.masked_fill(same_id_mask_inbatch, torch.finfo(logits_t2i.dtype).min)
-
-        # --- Queue logits ---
-        with torch.no_grad():
-            queue_img = self.image_queue.clone().detach()
-            queue_txt = self.text_queue.clone().detach()
-            queue_pids = self.queue_pids.clone().detach()
-
-        logits_i2t_queue = image_features @ queue_txt.t() * T
-        logits_t2i_queue = text_features @ queue_img.t() * T
-
-        # --- Mask false negatives ---
-        if pid_labels is not None:
-            same_id_mask = pid_labels.unsqueeze(1) == queue_pids.unsqueeze(0)
-            logits_i2t_queue = logits_i2t_queue.masked_fill(same_id_mask, torch.finfo(logits_i2t_queue.dtype).min)
-            logits_t2i_queue = logits_t2i_queue.masked_fill(same_id_mask, torch.finfo(logits_t2i_queue.dtype).min)
-
-        # --- Concatenate logits ---
-        logits_i2t = torch.cat([logits_i2t, logits_i2t_queue], dim=1)
-        logits_t2i = torch.cat([logits_t2i, logits_t2i_queue], dim=1)
-
-        # --- InfoNCE loss ---
-        loss_i2t = F.cross_entropy(logits_i2t, labels)
-        loss_t2i = F.cross_entropy(logits_t2i, labels)
-        loss = 0.5 * (loss_i2t + loss_t2i)
-
-        # --- Momentum encoder updates ---
-        with torch.no_grad():
-            # Image momentum
-            if image_encoder is not None:
-                if self.image_encoder_m is None:
-                    self.image_encoder_m = copy.deepcopy(image_encoder)
-                    for p in self.image_encoder_m.parameters():
-                        p.requires_grad = False
-                self._momentum_update(image_encoder, self.image_encoder_m)
-                img_keys = self.image_encoder_m(image_inputs).detach() if image_inputs is not None else image_features
-            else:
-                img_keys = image_features  # frozen
-
-            # Text momentum
-            if text_encoder is not None:
-                if self.text_encoder_m is None:
-                    self.text_encoder_m = copy.deepcopy(text_encoder)
-                    for p in self.text_encoder_m.parameters():
-                        p.requires_grad = False
-                self._momentum_update(text_encoder, self.text_encoder_m)
-                txt_keys = self.text_encoder_m(text_inputs).detach() if text_inputs is not None else text_features
-            else:
-                txt_keys = text_features  # frozen
-
-            # Enqueue
-            self._dequeue_and_enqueue(img_keys, txt_keys, pid_labels)
-
-        return loss
-    
 class PromptLearner(nn.Module):
     def __init__(self, 
                  text_tokenizer,
@@ -342,18 +197,7 @@ def tuning_vision_projection(dataset_names,
     optimizer = torch.optim.Adam(
         all_trainable_params + list(real_sup_con_loss.parameters()), lr=1e-3, weight_decay=1e-4)
 
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,      
-        end_factor=1.0,
-        total_iters=10
-    )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA-10, eta_min=1e-6)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[10]
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
     train_dataloaders = []
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
         train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False)
@@ -395,6 +239,7 @@ def tuning_vision_projection(dataset_names,
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     base_model.vision_model = base_model.vision_model.merge_and_unload()
+    save_checkpoint(base_model.eval(), None, real_sup_con_loss.temperature.exp().item(), N_EPOCHS_PRESTAGE, optimizer, scheduler)
     return base_model.eval()
 
 
@@ -433,7 +278,7 @@ def LoRA_tuning_variable_dataset(base_model,
 
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
-        train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True)
+        train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True, vision_model=base_model.vision_model)
         train_dataloaders.append(train_dataloader)
         
         if isinstance(class_names, str):
@@ -452,6 +297,7 @@ def LoRA_tuning_variable_dataset(base_model,
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
     sup_con_loss = MoCoInfoNCELoss(embedding_dim).to(device)
+    max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
@@ -524,7 +370,7 @@ def LoRA_tuning_variable_dataset(base_model,
                 text_hidden_state = modified_text_hidden_states[label_batch]
                 
                 loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
-                        0.25 * sup_con_loss(image_hidden_state_batch, text_hidden_state, label_batch)
+                        0.2 * max_sim_loss(image_hidden_state_batch, text_hidden_state)
                 total_loss += loss
 
             scaler.scale(total_loss).backward()

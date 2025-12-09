@@ -128,7 +128,7 @@ class RandomIdentitySampler(Sampler):
     def __len__(self):
         return self.length
 
-def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False, dual_branch=False):
+def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False, dual_branch=False, vision_model=None):
     unaugment_preprocessing = T.Compose([
             T.Resize(input_size),
             T.ToTensor(),
@@ -166,7 +166,7 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
                 with open(f"prompts_{dataset_name}.txt", "r", encoding="utf-8") as f:
                     ai_prompts = [prompt.strip() for prompt in f.readlines()]
             else:
-                ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size, dataset_name, class_name)
+                ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size, dataset_name, class_name, vision_model)
         else:
             ai_prompts = None
     else:

@@ -97,21 +97,6 @@ def _prepare_4d_attention_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: 
     else:
         return bool_mask.expand(batch, 1, tgt_len, src_len)
 
-                 # (B, C)
-
-def eos_gated_pool(x):
-    # x: (B, T, C)
-    eos = x[:, -1:, :]                         # (B, 1, C)
-    scores = (eos * x).sum(dim=-1, keepdim=True)  # dot with EOS
-    weights = torch.softmax(scores, dim=1)        # (B, T, 1)
-    return (x * weights).sum(dim=1)
-
-def cls_gated_pool(x):
-    cls = x[:, :1, :]                   # (B,1,C)
-    patches = x[:, 1:, :]               # (B,P,C)
-    scores = (cls * patches).sum(-1, keepdim=True)
-    weights = torch.softmax(scores, dim=1)
-    return (patches * weights).sum(dim=1)
 
 class SiglipvisionConfig:
 
@@ -551,26 +536,6 @@ class SiglipVisionTransformer(nn.Module):
 
         return pooler_output, last_hidden_state
 
-    def get_last_hidden_state(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None) -> torch.Tensor:
-        # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embedding_Dimension]
-        attention_mask = None
-        if self.config.version == "siglip":
-            hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding)
-        else:
-            pixel_values, attention_mask = self.pad_along_first_dim(self.convert_image_to_patches(pixel_values, self.config.patch_size), self.config.num_patches)
-            hidden_states = self.embeddings(pixel_values, spatial_shapes)
-            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype, hidden_states.shape[1])
-
-        last_hidden_state = self.encoder(inputs_embeds=hidden_states, attention_mask=attention_mask)
-
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-        pooled_last_hidden_state = cls_gated_pool(last_hidden_state)
-        return last_hidden_state, pooled_last_hidden_state
-
-    def get_pooler_output_by_hidden_state(self, last_hidden_state):
-        pooler_output = self.head(last_hidden_state)
-        return pooler_output
-
 
 class SiglipVisionModel(nn.Module):
 
@@ -585,7 +550,6 @@ class SiglipVisionModel(nn.Module):
         spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
         pooler_output, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
                                                              spatial_shapes=spatial_shapes)
-        last_hidden_state = cls_gated_pool(last_hidden_state)
         return pooler_output, last_hidden_state
 
     def get_last_hidden_state(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
@@ -807,7 +771,6 @@ class SiglipTextModel(nn.Module):
                                             inputs_embeds=inputs_embeds,
                                             domain_ids=domain_ids
         )
-        last_hidden_state = eos_gated_pool(last_hidden_state)
         return pooler_output, last_hidden_state
 
 

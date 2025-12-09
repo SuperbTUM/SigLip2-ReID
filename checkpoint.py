@@ -9,7 +9,7 @@ def save_checkpoint(
         scheduler=None
 ):
     path = f"checkpoint_epoch_{epoch}.pth"
-    prompter_states = [p.state_dict() for p in prompt_learners]
+    prompter_states = [p.state_dict() for p in prompt_learners] if prompt_learners is not None else []
     # Create a dictionary with all the states
     checkpoint = {
         'epoch': epoch,
