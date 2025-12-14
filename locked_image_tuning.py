@@ -2,8 +2,10 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import SupConLoss, MaxSimInfoNCE, MoCoInfoNCELoss
+from teacher import teacher_model_output
+from losses import SupConLoss, MaxSimInfoNCE, MoCoInfoNCELoss, mine_hard_triplets
 
+import math
 import transformers
 import torch
 import torch.nn as nn
@@ -102,8 +104,9 @@ def tuning_preparation(class_names,
         text_tokenizer=text_tokenizer,
         num_prompt_tokens=N_PROMPT_TOKEN, # hyper-parameter
         embedding_dim=embedding_dim,
-        class_names=class_names
-    ).to(device)
+        class_names=class_names,
+        device=device
+    )
 
     # 2. Define the Optimizer to train BOTH sets of parameters
     # This is the crucial step: you combine the parameters from both the
@@ -178,7 +181,7 @@ def tuning_vision_projection(dataset_names,
     base_model = model.load_weights(MODEL_NAME)
     base_model.train()
     lora_config = LoraConfig(
-        r=8,
+        r=16,
         lora_alpha=16,
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.1,
@@ -249,7 +252,8 @@ def LoRA_tuning_variable_dataset(base_model,
                                  class_names_list,
                                  device):
     # --- Shared model and optimizer ---
-    
+    if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth"):
+        base_model, _, _, _, _ = load_checkpoint(base_model, None, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
     lora_config = LoraConfig(
         r=8,
@@ -300,7 +304,7 @@ def LoRA_tuning_variable_dataset(base_model,
     max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
-        all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
+        all_trainable_params + list(sup_con_loss.parameters()) + list(max_sim_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.1,      
@@ -329,13 +333,13 @@ def LoRA_tuning_variable_dataset(base_model,
                 label = label.to(device)
                 # domain_ids = torch.ones_like(label) * i
                 image_features, image_last_hidden_state = lora_model.get_image_features(image_tensor)
-                image_features_list.append(image_features)
-                image_hidden_state_list.append(image_last_hidden_state)
+                image_features_list.append(image_features.cpu())
+                image_hidden_state_list.append(image_last_hidden_state.cpu().half())
                 image_label_list.append(label)
             image_features_lists.append(torch.cat(image_features_list, dim=0).to(device))
-            image_hidden_state_lists.append(torch.cat(image_hidden_state_list, dim=0).to(device))
+            image_hidden_state_lists.append(torch.cat(image_hidden_state_list, dim=0))
             image_label_lists.append(torch.cat(image_label_list, dim=0))
-
+        # teacher_model_outputs = teacher_model_output(train_dataloaders, ai_prompts)
     # --- Samplers for each dataset ---
     pk_samplers = [
         PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
@@ -345,11 +349,12 @@ def LoRA_tuning_variable_dataset(base_model,
     # --- Training Loop ---
     # Use itertools.cycle to handle datasets of different sizes
     num_batches = max(len(sampler) for sampler in pk_samplers)
-    # Create cyclic iterators
-    sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
 
     for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
+
+        # Create cyclic iterators
+        sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
         
         for step, (i, sampler_iter) in enumerate(itertools.cycle(enumerate(sampler_iters))):
             if step >= num_batches:  # stop after desired batches
@@ -359,10 +364,18 @@ def LoRA_tuning_variable_dataset(base_model,
 
             indices_batch, label_batch = next(sampler_iter)
             
-            image_features_batch = image_features_lists[i][indices_batch]
-            image_hidden_state_batch = image_hidden_state_lists[i][indices_batch]
+            image_features_batch = image_features_lists[i][indices_batch].to(device)
+            image_hidden_state_batch = image_hidden_state_lists[i][indices_batch].to(device)
             label_batch = torch.tensor(label_batch, device=device)
             domain_batch = i % 1
+
+            def warmup_factor(epoch, warmup=20, max_factor=0.4):
+                if epoch < warmup:
+                    return max_factor * (1 - math.exp(-epoch / (warmup/5)))
+                else:
+                    return max_factor
+
+            max_sim_factor = warmup_factor(epoch)
 
             with autocast(device):
                 modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model, domain_batch)
@@ -370,7 +383,7 @@ def LoRA_tuning_variable_dataset(base_model,
                 text_hidden_state = modified_text_hidden_states[label_batch]
                 
                 loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
-                        0.2 * max_sim_loss(image_hidden_state_batch, text_hidden_state)
+                        max_sim_factor * max_sim_loss(image_hidden_state_batch, text_hidden_state, label_batch)
                 total_loss += loss
 
             scaler.scale(total_loss).backward()

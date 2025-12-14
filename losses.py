@@ -7,7 +7,7 @@ class SupConLoss(nn.Module):
     def __init__(self, device):
         super(SupConLoss, self).__init__()
         self.device = device
-        self.temperature = nn.Parameter(torch.log(torch.tensor(0.07, device=device)))
+        self.temperature = nn.Parameter(torch.log(torch.tensor(1.0, device=device)))
 
     def forward(self, text_features, image_features, t_label, i_targets):
         temperature = self.temperature.exp().clamp(0.01, 10.0)
@@ -38,9 +38,9 @@ class SupConLoss(nn.Module):
 class MoCoInfoNCELoss(nn.Module):
     def __init__(self, 
                  feature_dim: int, 
-                 queue_size: int = 1024,
+                 queue_size: int = 32,
                  momentum: float = 0.999,
-                 temperature: float = 0.07):
+                 temperature: float = 1.0):
         super().__init__()
         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
         self.queue_size = queue_size
@@ -147,73 +147,91 @@ class MoCoInfoNCELoss(nn.Module):
 
         return loss
 
-def maxsim_similarity(image_tokens, text_tokens):
+def maxsim_similarity(image_tokens, text_tokens, temperature=1.0):
+    # L2-normalized embeddings
+    image_tokens = F.normalize(image_tokens, dim=-1)   # (B, I, D)
+    text_tokens  = F.normalize(text_tokens,  dim=-1)   # (B, T, D)
 
-    # (B, N_txt, D) → (B, 1, N_txt, D)
-    # (B, N_img, D) → (1, B, N_img, D)
-    t = text_tokens.unsqueeze(1)     # (B, 1, N_txt, D)
-    i = image_tokens.unsqueeze(0)    # (1, B, N_img, D)
+    # 1. Compute similarity
+    sim = torch.einsum("b t d, b i d -> b t i", text_tokens, image_tokens)  # (B, T, I)
 
-    # similarity between all text tokens and all image tokens
-    sim = torch.einsum("b1 t d, b2 i d -> b1 b2 t i", t, i)  # (B, B, N_txt, N_img)
+    attn_weights = F.softmax(sim / temperature, dim=-1) # (B, T, I)
+    
+    # 4. Compute weighted score
+    # This allows gradients to flow to ALL image tokens, proportional to their relevance.
+    # Even background tokens get a tiny gradient signal, preventing "dead neurons".
+    sim_smooth_max = (attn_weights * sim).sum(dim=-1) # (B, T)
 
-    # max over image tokens
-    sim_max = sim.max(dim=-1).values      # (B, B, N_txt)
-
-    # average over text tokens
-    sim_score = sim_max.mean(dim=-1)      # (B, B)
-
-    return sim_score
+    # 5. Aggregate
+    score = sim_smooth_max.mean(dim=-1) # (B,)
+    
+    return score
 
 class MaxSimInfoNCE(nn.Module):
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=1.0):
         super().__init__()
-        self.temperature = temperature
+        self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
 
-    def forward(self, image_tokens, text_tokens):
+    def forward(self, image_tokens, text_tokens, labels=None):
         # (B, B) similarity matrix
         sim = maxsim_similarity(image_tokens, text_tokens)
 
-        logits = sim / self.temperature
-        targets = torch.arange(logits.size(0), device=logits.device)
+        temperature = self.temperature.exp().clamp(0.01, 10.0)
+        logits = sim * temperature
 
-        # symmetric InfoNCE (optional, but recommended)
-        loss_i2t = F.cross_entropy(logits, targets)
-        loss_t2i = F.cross_entropy(logits.t(), targets)
+        if labels is None:
+            targets = torch.arange(logits.size(0), device=logits.device)
+            loss_i2t = F.cross_entropy(logits, targets)
+            loss_t2i = F.cross_entropy(logits.t(), targets)
+        else:
+            labels = labels.view(-1, 1)  
+            pos_mask = (labels == labels.t()).float() 
+            pos_per_sample = pos_mask.sum(dim=1, keepdim=True)   # (B, 1)
+            pos_weights = pos_mask / pos_per_sample.clamp(min=1)
 
-        return (loss_i2t + loss_t2i) * 0.5
+            # log-softmax over candidates
+            log_probs = F.log_softmax(logits, dim=-1)            # (B, B)
+
+            # Multi-positive NCE: sum over positive targets
+            loss_i2t = -(pos_weights * log_probs).sum(dim=1).mean()
+
+            # Symmetric (text → image)
+            log_probs_t = F.log_softmax(logits.t(), dim=-1)
+            loss_t2i = -(pos_weights * log_probs_t).sum(dim=1).mean()
+
+        return 0.5 * (loss_i2t + loss_t2i)
     
 
-def mine_hard_triplets(features, labels, base_margin=0.3, adaptive_weight=0.5, reg_weight=0.1):
+def mine_hard_triplets(features, labels, base_margin=0.3):
     """
-    Hard triplet mining with flexible, regularized adaptive margin.
+    Hard triplet mining (vectorized) with base margin.
+    Only uses hardest positive and hardest negative per anchor.
     
     Args:
         features: [B, D] tensor of embeddings.
         labels: [B] tensor of class indices.
-        base_margin: base margin value (float).
-        adaptive_weight: how strongly the margin adapts per sample.
-        reg_weight: regularization weight pulling adaptive margin back to base_margin.
+        base_margin: float, base margin value.
+        
+    Returns:
+        Scalar loss.
     """
-    dist_matrix = torch.cdist(features, features, p=2)
+    # Pairwise distance matrix
+    dist = torch.cdist(features, features, p=2)  # (B,B)
 
-    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+    # Masks
+    labels = labels.unsqueeze(1)
+    mask_positive = labels.eq(labels.T)
+    mask_negative = ~mask_positive
+    mask_positive.fill_diagonal_(False)  # remove self
 
-    # Hardest positive and negative distances
-    hardest_pos_dist = (dist_matrix * labels_eq.float()).max(dim=1)[0]
-    hardest_neg_dist = (dist_matrix + 1e5 * labels_eq.float()).min(dim=1)[0]
+    # Hardest positive: max distance among positives
+    hardest_pos_dist = torch.where(mask_positive, dist, torch.tensor(float('-inf'), device=features.device))
+    hardest_pos_dist, _ = hardest_pos_dist.max(dim=1)
 
-    # --- Adaptive margin component ---
-    # Example: use distance spread (neg - pos) as confidence
-    dist_diff = (hardest_neg_dist - hardest_pos_dist).detach()
-    adaptive_margin = base_margin + adaptive_weight * (0.3 - torch.tanh(dist_diff))
-    # Smooth clamp to avoid exploding margin
-    adaptive_margin = torch.clamp(adaptive_margin, 0.05, 0.6)
+    # Hardest negative: min distance among negatives
+    hardest_neg_dist = torch.where(mask_negative, dist, torch.tensor(float('inf'), device=features.device))
+    hardest_neg_dist, _ = hardest_neg_dist.min(dim=1)
 
-    # --- Triplet loss with adaptive margin ---
-    triplet_loss = F.relu(hardest_pos_dist - hardest_neg_dist + adaptive_margin)
-    
-    # --- Regularization to keep margins near base ---
-    reg_loss = reg_weight * (adaptive_margin - base_margin).abs().mean()
-
-    return triplet_loss.mean() + reg_loss
+    # Triplet loss
+    loss = F.relu(hardest_pos_dist - hardest_neg_dist + base_margin)
+    return loss.mean()

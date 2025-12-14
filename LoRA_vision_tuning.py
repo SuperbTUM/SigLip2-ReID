@@ -107,7 +107,7 @@ def LoRA_vision_tuning(
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         [
-            {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()) + list(max_sim_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
             {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
@@ -121,7 +121,7 @@ def LoRA_vision_tuning(
             lr_factor = start_lr / base_lr + (1 - start_lr / base_lr) * (epoch / warmup_epochs)
             return lr_factor
 
-    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-4, base_lr=5e-3))
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-5, base_lr=5e-4))
     multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
 
     scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -181,7 +181,7 @@ def LoRA_vision_tuning(
                     text_hidden_state = modified_text_hidden_states[i][label]
                 
                 loss_sigmoid = sup_con_loss(image_features_orig, text_features, label) + \
-                                0.2 * max_sim_loss(last_hidden_state_orig, text_hidden_state)
+                                0.4 * max_sim_loss(last_hidden_state_orig, text_hidden_state, label)
 
                 # Triplet loss
                 loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3)
