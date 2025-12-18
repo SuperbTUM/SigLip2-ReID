@@ -2,8 +2,8 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from teacher import teacher_model_output
-from losses import SupConLoss, MaxSimInfoNCE, MoCoInfoNCELoss, mine_hard_triplets
+# from teacher import teacher_model_output
+from losses import SupConLoss, MoCoInfoNCELoss, lora_orthogonality_loss, collect_trainable_lora_As
 
 import math
 import transformers
@@ -192,6 +192,9 @@ def tuning_vision_projection(dataset_names,
     base_model.vision_model = get_peft_model(base_model.vision_model, lora_config)
     for param in base_model.text_model.parameters():
         param.requires_grad = False
+    for name, param in base_model.vision_model.named_parameters():
+        if "attention_pooling" in name.lower():
+            param.requires_grad = True
     base_model = base_model.to(device)
     all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters()))
 
@@ -200,7 +203,6 @@ def tuning_vision_projection(dataset_names,
     optimizer = torch.optim.Adam(
         all_trainable_params + list(real_sup_con_loss.parameters()), lr=1e-3, weight_decay=1e-4)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
     train_dataloaders = []
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
         train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False)
@@ -208,7 +210,13 @@ def tuning_vision_projection(dataset_names,
     
     # --- Training Loop ---
     num_batches = max(len(loader) for loader in train_dataloaders)
-    
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=2e-3,
+        total_steps=num_batches * N_EPOCHS_PRESTAGE,
+        pct_start=0.2,
+        final_div_factor=10
+    )
 
     for epoch in range(N_EPOCHS_PRESTAGE):
         loss_by_epoch = 0
@@ -228,17 +236,18 @@ def tuning_vision_projection(dataset_names,
             domain_batch = i % 1
 
             with autocast(device):
-                image_features_batch = base_model.get_image_features(image_tensor.to(device))[0]
+                image_features_batch, image_last_hidden_state = base_model.get_image_features(image_tensor.to(device))
 
                 image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch)
-                loss = image_contrastive_loss
+                distillation_loss = 1 - (F.normalize(image_features_batch, dim=1) * F.normalize(image_last_hidden_state, dim=1)).sum(dim=-1).mean()
+                loss = image_contrastive_loss + 0.1 * distillation_loss
                 total_loss += loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
             loss_by_epoch += total_loss.item()
-        scheduler.step()
+            scheduler.step()
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     base_model.vision_model = base_model.vision_model.merge_and_unload()
@@ -279,7 +288,7 @@ def LoRA_tuning_variable_dataset(base_model,
     #     if "dal" in name.lower():
     #         for p in m.parameters():
     #             p.requires_grad = True
-
+    lora_params = collect_trainable_lora_As(lora_model)
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
         train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True, vision_model=base_model.vision_model)
@@ -301,10 +310,10 @@ def LoRA_tuning_variable_dataset(base_model,
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
     sup_con_loss = MoCoInfoNCELoss(embedding_dim).to(device)
-    max_sim_loss = MaxSimInfoNCE().to(device)
+    # max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
-        all_trainable_params + list(sup_con_loss.parameters()) + list(max_sim_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
+        all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.1,      
@@ -333,10 +342,10 @@ def LoRA_tuning_variable_dataset(base_model,
                 label = label.to(device)
                 # domain_ids = torch.ones_like(label) * i
                 image_features, image_last_hidden_state = lora_model.get_image_features(image_tensor)
-                image_features_list.append(image_features.cpu())
-                image_hidden_state_list.append(image_last_hidden_state.cpu().half())
+                image_features_list.append(image_features)
+                image_hidden_state_list.append(image_last_hidden_state)
                 image_label_list.append(label)
-            image_features_lists.append(torch.cat(image_features_list, dim=0).to(device))
+            image_features_lists.append(torch.cat(image_features_list, dim=0))
             image_hidden_state_lists.append(torch.cat(image_hidden_state_list, dim=0))
             image_label_lists.append(torch.cat(image_label_list, dim=0))
         # teacher_model_outputs = teacher_model_output(train_dataloaders, ai_prompts)
@@ -364,26 +373,28 @@ def LoRA_tuning_variable_dataset(base_model,
 
             indices_batch, label_batch = next(sampler_iter)
             
-            image_features_batch = image_features_lists[i][indices_batch].to(device)
-            image_hidden_state_batch = image_hidden_state_lists[i][indices_batch].to(device)
+            image_features_batch = image_features_lists[i][indices_batch]
+            image_hidden_state_batch = image_hidden_state_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
             domain_batch = i % 1
 
-            def warmup_factor(epoch, warmup=20, max_factor=0.4):
-                if epoch < warmup:
-                    return max_factor * (1 - math.exp(-epoch / (warmup/5)))
-                else:
-                    return max_factor
+            # def warmup_factor(epoch, warmup=20, max_factor=0.4):
+            #     if epoch < warmup:
+            #         return max_factor * (1 - math.exp(-epoch / (warmup/5)))
+            #     else:
+            #         return max_factor
 
-            max_sim_factor = warmup_factor(epoch)
+            # max_sim_factor = warmup_factor(epoch)
 
             with autocast(device):
                 modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
-                text_hidden_state = modified_text_hidden_states[label_batch]
+                # text_hidden_state = modified_text_hidden_states[label_batch]
                 
+                # max_sim_factor * max_sim_loss(image_hidden_state_batch, text_hidden_state, label_batch) + \
                 loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
-                        max_sim_factor * max_sim_loss(image_hidden_state_batch, text_hidden_state, label_batch)
+                        0.2 * sup_con_loss(image_hidden_state_batch, text_features, label_batch) + \
+                        1e-4 * lora_orthogonality_loss(lora_params)
                 total_loss += loss
 
             scaler.scale(total_loss).backward()

@@ -147,59 +147,59 @@ class MoCoInfoNCELoss(nn.Module):
 
         return loss
 
-def maxsim_similarity(image_tokens, text_tokens, temperature=1.0):
-    # L2-normalized embeddings
-    image_tokens = F.normalize(image_tokens, dim=-1)   # (B, I, D)
-    text_tokens  = F.normalize(text_tokens,  dim=-1)   # (B, T, D)
+# def maxsim_similarity(image_tokens, text_tokens, temperature=1.0):
+#     # L2-normalized embeddings
+#     image_tokens = F.normalize(image_tokens, dim=-1)   # (B, I, D)
+#     text_tokens  = F.normalize(text_tokens,  dim=-1)   # (B, T, D)
 
-    # 1. Compute similarity
-    sim = torch.einsum("b t d, b i d -> b t i", text_tokens, image_tokens)  # (B, T, I)
+#     # 1. Compute similarity
+#     sim = torch.einsum("b t d, b i d -> b t i", text_tokens, image_tokens)  # (B, T, I)
 
-    attn_weights = F.softmax(sim / temperature, dim=-1) # (B, T, I)
+#     attn_weights = F.softmax(sim / temperature, dim=-1) # (B, T, I)
     
-    # 4. Compute weighted score
-    # This allows gradients to flow to ALL image tokens, proportional to their relevance.
-    # Even background tokens get a tiny gradient signal, preventing "dead neurons".
-    sim_smooth_max = (attn_weights * sim).sum(dim=-1) # (B, T)
+#     # 4. Compute weighted score
+#     # This allows gradients to flow to ALL image tokens, proportional to their relevance.
+#     # Even background tokens get a tiny gradient signal, preventing "dead neurons".
+#     sim_smooth_max = (attn_weights * sim).sum(dim=-1) # (B, T)
 
-    # 5. Aggregate
-    score = sim_smooth_max.mean(dim=-1) # (B,)
+#     # 5. Aggregate
+#     score = sim_smooth_max.mean(dim=-1) # (B,)
     
-    return score
+#     return score
 
-class MaxSimInfoNCE(nn.Module):
-    def __init__(self, temperature=1.0):
-        super().__init__()
-        self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
+# class MaxSimInfoNCE(nn.Module):
+#     def __init__(self, temperature=1.0):
+#         super().__init__()
+#         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
 
-    def forward(self, image_tokens, text_tokens, labels=None):
-        # (B, B) similarity matrix
-        sim = maxsim_similarity(image_tokens, text_tokens)
+#     def forward(self, image_tokens, text_tokens, labels=None):
+#         # (B, B) similarity matrix
+#         sim = maxsim_similarity(image_tokens, text_tokens)
 
-        temperature = self.temperature.exp().clamp(0.01, 10.0)
-        logits = sim * temperature
+#         temperature = self.temperature.exp().clamp(0.01, 10.0)
+#         logits = sim * temperature
 
-        if labels is None:
-            targets = torch.arange(logits.size(0), device=logits.device)
-            loss_i2t = F.cross_entropy(logits, targets)
-            loss_t2i = F.cross_entropy(logits.t(), targets)
-        else:
-            labels = labels.view(-1, 1)  
-            pos_mask = (labels == labels.t()).float() 
-            pos_per_sample = pos_mask.sum(dim=1, keepdim=True)   # (B, 1)
-            pos_weights = pos_mask / pos_per_sample.clamp(min=1)
+#         if labels is None:
+#             targets = torch.arange(logits.size(0), device=logits.device)
+#             loss_i2t = F.cross_entropy(logits, targets)
+#             loss_t2i = F.cross_entropy(logits.t(), targets)
+#         else:
+#             labels = labels.view(-1, 1)  
+#             pos_mask = (labels == labels.t()).float() 
+#             pos_per_sample = pos_mask.sum(dim=1, keepdim=True)   # (B, 1)
+#             pos_weights = pos_mask / pos_per_sample.clamp(min=1)
 
-            # log-softmax over candidates
-            log_probs = F.log_softmax(logits, dim=-1)            # (B, B)
+#             # log-softmax over candidates
+#             log_probs = F.log_softmax(logits, dim=-1)            # (B, B)
 
-            # Multi-positive NCE: sum over positive targets
-            loss_i2t = -(pos_weights * log_probs).sum(dim=1).mean()
+#             # Multi-positive NCE: sum over positive targets
+#             loss_i2t = -(pos_weights * log_probs).sum(dim=1).mean()
 
-            # Symmetric (text → image)
-            log_probs_t = F.log_softmax(logits.t(), dim=-1)
-            loss_t2i = -(pos_weights * log_probs_t).sum(dim=1).mean()
+#             # Symmetric (text → image)
+#             log_probs_t = F.log_softmax(logits.t(), dim=-1)
+#             loss_t2i = -(pos_weights * log_probs_t).sum(dim=1).mean()
 
-        return 0.5 * (loss_i2t + loss_t2i)
+#         return 0.5 * (loss_i2t + loss_t2i)
     
 
 def mine_hard_triplets(features, labels, base_margin=0.3):
@@ -235,3 +235,30 @@ def mine_hard_triplets(features, labels, base_margin=0.3):
     # Triplet loss
     loss = F.relu(hardest_pos_dist - hardest_neg_dist + base_margin)
     return loss.mean()
+
+def collect_trainable_lora_As(model):
+    lora_As = []
+
+    for module in model.modules():
+        if not hasattr(module, "lora_A"):
+            continue
+
+        for lora_A in module.lora_A.values():
+            if lora_A.weight.requires_grad:
+                lora_As.append(lora_A.weight)
+
+    return lora_As
+
+def lora_orthogonality_loss(lora_As):
+    loss = 0.0
+
+    for A in lora_As:
+        A = A.float()     # AMP-safe
+        r = A.size(0)
+
+        # (A Aᵀ − I)
+        gram = A @ A.T
+        I = torch.eye(r, device=A.device)
+        loss = loss + torch.norm(gram - I, p="fro") ** 2
+
+    return loss / len(lora_As)

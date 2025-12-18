@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import MoCoInfoNCELoss, MaxSimInfoNCE, mine_hard_triplets
+from losses import MoCoInfoNCELoss, mine_hard_triplets
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -90,24 +90,27 @@ def LoRA_vision_tuning(
         lora_config = LoraConfig(
             r=16,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "out_proj", "k_proj"], # Experiment
+            target_modules=["q_proj", "v_proj", "k_proj"], # Experiment
             lora_dropout=0.1,
             use_dora=True,
             init_lora_weights="eva"
         )
     # This creates the *new* trainable LoRA parameters
     vision_model = get_peft_model(base_model.vision_model, lora_config)
+    for name, param in vision_model.named_parameters():
+        if "attention_pooling" in name.lower():
+            param.requires_grad = True
     vision_model.print_trainable_parameters()
     vision_model = vision_model.to(device)
 
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
     sup_con_loss = MoCoInfoNCELoss(embedding_dim, temperature=temperature).to(device)
-    max_sim_loss = MaxSimInfoNCE().to(device)
+    # max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         [
-            {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()) + list(max_sim_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
             {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
@@ -178,13 +181,15 @@ def LoRA_vision_tuning(
                 # Sigmoid loss
                 with torch.no_grad():
                     text_features = modified_text_embeddings[i][label]
-                    text_hidden_state = modified_text_hidden_states[i][label]
+                    # text_hidden_state = modified_text_hidden_states[i][label]
                 
+                # 0.4 * max_sim_loss(last_hidden_state_orig, text_hidden_state, label)
                 loss_sigmoid = sup_con_loss(image_features_orig, text_features, label) + \
-                                0.4 * max_sim_loss(last_hidden_state_orig, text_hidden_state, label)
+                                0.2 * sup_con_loss(last_hidden_state_orig, text_features, label)
 
                 # Triplet loss
-                loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3)
+                loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \
+                                mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
                 total_loss += loss_triplet + loss_ce + loss_sigmoid
 
             # Normalize loss for accumulation

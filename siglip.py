@@ -4,6 +4,20 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
+class AttentionPooling(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(dim))
+        self.scale = dim ** -0.5
+
+    def forward(self, x):  # x: [B, N, D]
+        x = F.normalize(x, dim=-1)
+        attn = (x @ self.query) * self.scale
+        attn = attn.softmax(dim=1)
+        pooled = (attn.unsqueeze(-1) * x).sum(dim=1)
+        return pooled
+
+
 class DAL(nn.Module):
     """
     Domain Adaptation Layer (DAL)
@@ -543,6 +557,7 @@ class SiglipVisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
+        self.attention_pooling = AttentionPooling(config.hidden_size)
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
@@ -550,14 +565,9 @@ class SiglipVisionModel(nn.Module):
         spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
         pooler_output, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
                                                              spatial_shapes=spatial_shapes)
+        
+        last_hidden_state = self.attention_pooling(last_hidden_state)
         return pooler_output, last_hidden_state
-
-    def get_last_hidden_state(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
-        # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
-        bs, _, h, w = pixel_values.shape
-        spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
-        return self.vision_model.get_last_hidden_state(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
-                                                             spatial_shapes=spatial_shapes)
 
 
 class SiglipTextConfig:
