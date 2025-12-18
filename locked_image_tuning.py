@@ -238,7 +238,7 @@ def tuning_vision_projection(dataset_names,
             with autocast(device):
                 image_features_batch, image_last_hidden_state = base_model.get_image_features(image_tensor.to(device))
 
-                image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch)
+                image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch, True)
                 distillation_loss = 1 - (F.normalize(image_features_batch, dim=1) * F.normalize(image_last_hidden_state, dim=1)).sum(dim=-1).mean()
                 loss = image_contrastive_loss + 0.1 * distillation_loss
                 total_loss += loss

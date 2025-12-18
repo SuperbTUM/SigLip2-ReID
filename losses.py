@@ -9,7 +9,7 @@ class SupConLoss(nn.Module):
         self.device = device
         self.temperature = nn.Parameter(torch.log(torch.tensor(1.0, device=device)))
 
-    def forward(self, text_features, image_features, t_label, i_targets):
+    def forward(self, text_features, image_features, t_label, i_targets, same_modality=False):
         temperature = self.temperature.exp().clamp(0.01, 10.0)
 
         batch_size = text_features.shape[0]
@@ -18,17 +18,18 @@ class SupConLoss(nn.Module):
             i_targets.unsqueeze(0).expand(batch_size,batch_size_N)).float().to(self.device)
 
         logits = torch.div(torch.matmul(text_features, image_features.T), temperature)
-        logits_mask = torch.scatter(
-            torch.ones_like(mask), 
-            1, 
-            torch.arange(batch_size).view(-1, 1).to(self.device), 
-            0
-        )
-        mask = mask * logits_mask
+        if same_modality:
+            logits_mask = torch.scatter(
+                torch.ones_like(mask), 
+                1, 
+                torch.arange(batch_size).view(-1, 1).to(self.device), 
+                0
+            )
+            mask = mask * logits_mask
         # for numerical stability
         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
-        exp_logits = torch.exp(logits) * logits_mask
+        exp_logits = torch.exp(logits)
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - mean_log_prob_pos.mean()
