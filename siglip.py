@@ -7,7 +7,7 @@ from typing import Tuple, Optional
 class AttentionPooling(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.query = nn.Parameter(torch.randn(dim))
+        self.query = nn.Parameter(torch.zeros(dim))
         self.scale = dim ** -0.5
 
     def forward(self, x):  # x: [B, N, D]

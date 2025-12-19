@@ -26,10 +26,12 @@ class SupConLoss(nn.Module):
                 0
             )
             mask = mask * logits_mask
+        else:
+            logits_mask = torch.ones_like(mask)
         # for numerical stability
         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
-        exp_logits = torch.exp(logits)
+        exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
         loss = - mean_log_prob_pos.mean()

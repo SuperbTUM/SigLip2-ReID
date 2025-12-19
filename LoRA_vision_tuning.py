@@ -9,7 +9,7 @@ from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_d
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+# from torch.utils.checkpoint import checkpoint
 from torch.amp import autocast, GradScaler
 from typing import List, Optional
 import itertools
@@ -96,6 +96,8 @@ def LoRA_vision_tuning(
             init_lora_weights="eva"
         )
     # This creates the *new* trainable LoRA parameters
+    if hasattr(base_model.vision_model, "peft_config"):
+        del base_model.vision_model.peft_config
     vision_model = get_peft_model(base_model.vision_model, lora_config)
     for name, param in vision_model.named_parameters():
         if "attention_pooling" in name.lower():
@@ -149,9 +151,9 @@ def LoRA_vision_tuning(
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
 
-    def fwd(x):
-        image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False)
-        return image_features, last_hidden_state
+    # def fwd(x):
+    #     image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False)
+    #     return image_features, last_hidden_state
     
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
@@ -170,13 +172,14 @@ def LoRA_vision_tuning(
             label = label.to(device)
 
             with autocast(device, torch.float16):
-                image_features, last_hidden_state = checkpoint(fwd, image_tensor, use_reentrant=False)
+                image_features, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
+                # image_features, last_hidden_state = checkpoint(fwd, image_tensor, use_reentrant=False)
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
                 loss_ce = criterion[i](logits, label)
-
-                image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, use_reentrant=False)
+                image_features_orig, last_hidden_state_orig = vision_model(pixel_values=image_tensor_orig, interpolate_pos_encoding=False)
+                # image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, use_reentrant=False)
                 
                 # Sigmoid loss
                 with torch.no_grad():
