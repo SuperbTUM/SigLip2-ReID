@@ -65,6 +65,7 @@ def generate_prompt(image_paths, input_size, class_name):
         f"Summarize only the distinctive color, texture, and shape features of this {class_name} in Image A. Only focus on the {class_name} appearance not motion.",
     ]
 
+    core_imgs = [[{"type": "image", "path": img_path}, {"type": "image", "path": hard_sample}] for img_path, hard_sample in image_paths]
     messages_batch = [
         [
             {
@@ -76,17 +77,17 @@ def generate_prompt(image_paths, input_size, class_name):
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "path": img_path},
+                    core_img[0],
                     {"type": "text", "text": "Image A above."},
-                    {"type": "image", "path": hard_sample},
+                    core_img[1],
                     {"type": "text", "text": "Image B above."},
                     {"type": "text", "text": random.choice(user_prompts)},
                 ]
             } 
-        ] for img_path, hard_sample in image_paths
+        ] for core_img in core_imgs
     ]
 
-    all_generated_texts = []
+    all_generated_texts_contrast = []
     batch_size = 16
 
     for i in range(0, len(messages_batch), batch_size):
@@ -112,14 +113,72 @@ def generate_prompt(image_paths, input_size, class_name):
         for generated_text in processor.batch_decode(generated_ids, skip_special_tokens=True):
             # Collect the response
             generated_text = generated_text.split("\n")[6].replace("Assistant: ", "").replace(f"The {class_name} in Image A", "").strip()
-            all_generated_texts.append(generated_text)  # single response per image
+            all_generated_texts_contrast.append(generated_text)  # single response per image
+    
+    system_prompt = f"""
+        You are a Re-Identification assistant for {class_name} object. Focus on describing unique, identity-specific visual features, ignoring background or pose of the {class_name} in the image. 
+    """
+    user_prompts = [
+        f"Describe the unique visual traits that distinguish this {class_name} from others. Only focus on the {class_name} appearance not motion.",
+        f"What fine-grained details identify this exact {class_name}? Only focus on the {class_name} appearance not motion.",
+        f"Summarize only the distinctive color, texture, and shape features of this {class_name}. Only focus on the {class_name} appearance not motion.",
+    ]
 
-    return all_generated_texts
+    messages_batch = [
+        [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": system_prompt}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    core_img[0],
+                    {"type": "text", "text": random.choice(user_prompts)},
+                ]
+            } 
+        ] for core_img in core_imgs
+    ]
+
+    all_generated_texts_full = []
+    batch_size = 16
+
+    for i in range(0, len(messages_batch), batch_size):
+        # Apply chat template
+        inputs = processor.apply_chat_template(
+            messages_batch[i:i+batch_size],
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True
+        ).to(model.device, dtype=torch.bfloat16)
+
+        # Generate output
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=48,
+                do_sample=False,
+            )
+
+        # Decode
+        for generated_text_full in processor.batch_decode(generated_ids, skip_special_tokens=True):
+            # Collect the response
+            generated_text_full = generated_text_full.split("\n")[4].replace("Assistant: ", "").strip()
+            all_generated_texts_full.append(generated_text_full)  # single response per image
+
+    return all_generated_texts_contrast, all_generated_texts_full
 
 def get_ai_prompt_by_dataset(dataset, num_pids, input_size, dataset_name, class_name, vision_model):
     img_paths = sample_dataset(dataset, num_pids, input_size, vision_model)
-    all_generated_texts = generate_prompt(img_paths, input_size, class_name)
-    with open(f"prompts_{dataset_name}.txt", "w", encoding="utf-8") as f:
-        for generated_prompt in all_generated_texts:
+    all_generated_texts_contrast, all_generated_texts_full = generate_prompt(img_paths, input_size, class_name)
+    with open(f"prompts_{dataset_name}_contrast.txt", "w", encoding="utf-8") as f:
+        for generated_prompt in all_generated_texts_contrast:
             f.write(generated_prompt + "\n")
-    return all_generated_texts
+    with open(f"prompts_{dataset_name}_full.txt", "w", encoding="utf-8") as f:
+        for generated_prompt in all_generated_texts_full:
+            f.write(generated_prompt + "\n")
+    return all_generated_texts_contrast + all_generated_texts_full

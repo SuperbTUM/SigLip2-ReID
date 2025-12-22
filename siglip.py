@@ -749,7 +749,7 @@ class Siglip2TextTransformer(nn.Module):
         # pooled_output = self.dal(pooled_output, domain_ids) #?
         pooled_output = self.head(pooled_output)
         
-        return pooled_output, last_hidden_state
+        return pooled_output
 
 
 class SiglipTextModel(nn.Module):
@@ -775,13 +775,13 @@ class SiglipTextModel(nn.Module):
 
         ```"""
 
-        pooler_output, last_hidden_state = self.text_model(
+        pooler_output = self.text_model(
                                             input_ids=input_ids,
                                             attention_mask=attention_mask,
                                             inputs_embeds=inputs_embeds,
                                             domain_ids=domain_ids
         )
-        return pooler_output, last_hidden_state
+        return pooler_output
 
 
 class SiglipConfig(nn.Module):
@@ -865,13 +865,13 @@ class SiglipModel(nn.Module):
         ```"""
         # Use SigLIP model's config for some fields (if specified) instead of those of vision & text components.
 
-        pooled_output, last_hidden_state = self.text_model(
+        pooled_output = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             domain_ids=domain_ids
         )
 
-        return pooled_output, last_hidden_state
+        return pooled_output
 
     def get_image_features(
             self,

@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import MoCoInfoNCELoss, mine_hard_triplets
+from losses import HardTextQueueLoss, mine_hard_triplets
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -107,7 +107,7 @@ def LoRA_vision_tuning(
 
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
-    sup_con_loss = MoCoInfoNCELoss(embedding_dim, temperature=temperature).to(device)
+    sup_con_loss = HardTextQueueLoss(embedding_dim, temperature=temperature).to(device)
     # max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
@@ -138,15 +138,13 @@ def LoRA_vision_tuning(
 
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
-    modified_text_hidden_states = []
     for i, prompt_learner in enumerate(prompt_learners):
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
         with torch.no_grad():
-            modified_text_embedding, modified_text_hidden_state = prompt_learner(text_model, i % 1)
+            modified_text_embedding = prompt_learner(text_model, i % 1)
             modified_text_embeddings.append(modified_text_embedding)
-            modified_text_hidden_states.append(modified_text_hidden_state)
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed

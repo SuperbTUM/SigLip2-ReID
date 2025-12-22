@@ -3,7 +3,7 @@ from constants import *
 from data_preparation import *
 from checkpoint import *
 # from teacher import teacher_model_output
-from losses import SupConLoss, MoCoInfoNCELoss, lora_orthogonality_loss, collect_trainable_lora_As
+from losses import SupConLoss, HardTextQueueLoss, lora_orthogonality_loss, collect_trainable_lora_As
 
 import math
 import transformers
@@ -67,7 +67,7 @@ class PromptLearner(nn.Module):
         # class_name_embs: (N, L', D)
         # Prepend the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
-        combined_embs = torch.cat([self.prompt, self.class_name_embedding], dim=1)
+        combined_embs = torch.cat([self.class_name_embedding, self.prompt], dim=1)
         
         # Pass the combined embeddings through the rest of the text encoder
         # This part requires a custom forward pass through the text model layers
@@ -77,101 +77,9 @@ class PromptLearner(nn.Module):
         # A simplified representation of passing through the encoder:
         # Note: The actual `transformers` implementation requires passing embeddings
         # through `model.text_model.encoder` and then `model.text_model.final_layer_norm`.
-        prompted_text_features, prompted_text_hidden_state = text_model(inputs_embeds=combined_embs, domain_ids=domain_ids)
+        prompted_text_features = text_model(inputs_embeds=combined_embs, domain_ids=domain_ids)
         
-        return prompted_text_features, prompted_text_hidden_state
-
-def tuning_preparation(class_names, 
-                       device):
-    # --- Setup from before ---
-    base_model = model.load_weights(MODEL_NAME)
-    text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.1,
-    )
-    base_model.text_model = get_peft_model(base_model.text_model, lora_config)
-    lora_model = base_model.to(device)
-    # --- End of previous setup ---
-
-
-    # 1. Instantiate the Prompt Learner
-    # We need to know the embedding dimension of our text model.
-    embedding_dim = lora_model.config.text_config.hidden_size
-    prompt_learner = PromptLearner(
-        text_tokenizer=text_tokenizer,
-        num_prompt_tokens=N_PROMPT_TOKEN, # hyper-parameter
-        embedding_dim=embedding_dim,
-        class_names=class_names,
-        device=device
-    )
-
-    # 2. Define the Optimizer to train BOTH sets of parameters
-    # This is the crucial step: you combine the parameters from both the
-    # prompt_learner and the LoRA-adapted model.
-    trainable_params = list(prompt_learner.parameters()) + list(lora_model.parameters())
-    optimizer = torch.optim.Adam(trainable_params, lr=3.5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA, eta_min=1e-6)
-    sup_con_loss = SupConLoss(device)
-    scaler = GradScaler(device)
-
-    return lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss
-
-
-def LoRA_tuning(dataset_name, 
-                input_size, 
-                class_names,
-                device):
-    train_dataloader, _, n_cls = create_dataloader(dataset_name, input_size, "train", False)
-    if isinstance(class_names, str):
-        class_names = [class_names] * n_cls
-    lora_model, prompt_learner, optimizer, scheduler, scaler, sup_con_loss = tuning_preparation(class_names, device)
-    image_features_list = []
-    image_label_list = []
-    with torch.inference_mode():
-        for batch in train_dataloader:
-            image_tensor, label = batch[:2]
-            image_tensor = image_tensor.to(device)
-            label = label.to(device)
-            image_features = lora_model.get_image_features(image_tensor)[0]
-            image_features_list.append(image_features)
-            image_label_list.append(label)
-    
-    image_features_list = torch.cat(image_features_list, dim=0)
-    image_label_list = torch.cat(image_label_list, dim=0)
-    pk_sampler = PKsamplerWithLabels(image_label_list.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
-
-    for epoch in range(N_EPOCHS_LoRA):
-        loss_by_epoch = 0
-        for iters, (indices_batch, label_batch) in enumerate(pk_sampler):
-            image_features_batch = image_features_list[indices_batch]
-            label_batch = torch.tensor(label_batch, device=device)
-            
-            optimizer.zero_grad()
-
-            with autocast(device):
-                # 3. Use the Prompt Learner
-                # Pass the initial embeddings through the prompt learner to get the combined embeddings.
-                modified_text_embeddings = prompt_learner(lora_model.text_model)[0]
-
-                # 4. Forward pass through the LoRA-adapted model
-                # The model now receives the modified input.
-                # Note: This is a simplified forward pass. The actual call might differ based on the model.
-                # The key is that `modified_text_embeddings` is the input, not the original `token_embeddings`.
-                text_features = modified_text_embeddings[label_batch]
-                
-                # Your loss calculation and backpropagation would follow...
-                loss = sup_con_loss(text_features, image_features_batch, label_batch, label_batch) + \
-                        sup_con_loss(image_features_batch, text_features, label_batch, label_batch)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            loss_by_epoch += loss.item()
-        print("Avg loss at epoch {} is {}.".format(epoch, loss_by_epoch / iters))
-    return lora_model.eval()
+        return prompted_text_features
 
 
 def tuning_vision_projection(dataset_names,
@@ -264,6 +172,7 @@ def LoRA_tuning_variable_dataset(base_model,
     if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth"):
         base_model, _, _, _, _ = load_checkpoint(base_model, None, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
+    frozen_text_model = copy.deepcopy(base_model.text_model.eval())
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -283,6 +192,9 @@ def LoRA_tuning_variable_dataset(base_model,
     # --- Dataloaders and Prompt Learners for each dataset ---
     train_dataloaders = []
     prompt_learners = []
+    full_prompts = []
+    full_init_prompts = []
+    n_clses = []
     all_trainable_params = list(filter(lambda p: p.requires_grad, lora_model.parameters()))
     # for name, m in lora_model.text_model.named_modules():
     #     if "dal" in name.lower():
@@ -293,7 +205,11 @@ def LoRA_tuning_variable_dataset(base_model,
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
         train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True, vision_model=base_model.vision_model)
         train_dataloaders.append(train_dataloader)
-        
+        n_clses.append(n_cls)
+        init_prompts = ai_prompts[:(len(ai_prompts) >> 1)]
+        full_prompts.append(text_tokenizer(ai_prompts[(len(ai_prompts)>>1):], padding=True, return_tensors="pt").input_ids.to(device))
+        full_init_prompts.append(text_tokenizer(ai_prompts[:(len(ai_prompts)>>1)], padding=True, return_tensors="pt").input_ids.to(device))
+
         if isinstance(class_names, str):
             class_names = [class_names] * n_cls
 
@@ -304,12 +220,12 @@ def LoRA_tuning_variable_dataset(base_model,
             embedding_dim=embedding_dim,
             device=device,
             class_names=class_names,
-            init_prompts=ai_prompts
+            init_prompts=init_prompts
         )
         prompt_learners.append(prompt_learner)
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
-    sup_con_loss = MoCoInfoNCELoss(embedding_dim).to(device)
+    sup_con_loss = HardTextQueueLoss(embedding_dim).to(device)
     # max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
@@ -331,7 +247,20 @@ def LoRA_tuning_variable_dataset(base_model,
     image_features_lists = []
     image_hidden_state_lists = []
     image_label_lists = []
+    frozen_text_features_list = []
+    frozen_init_text_features_list = []
     with torch.inference_mode():
+        batch_size = 32
+        frozen_text_feature_list = []
+        frozen_init_text_feature_list = []
+        for j, n_cls in enumerate(n_clses):
+            for i in range(0, n_cls, batch_size):
+                text_features = frozen_text_model(full_prompts[j][i:i+batch_size])
+                init_text_features = frozen_text_model(full_init_prompts[j][i:i+batch_size])
+                frozen_text_feature_list.append(text_features)
+                frozen_init_text_feature_list.append(init_text_features)
+            frozen_text_features_list.append(torch.cat(frozen_text_feature_list, dim=0))
+            frozen_init_text_features_list.append(torch.cat(frozen_init_text_feature_list, dim=0))
         for i, train_dataloader in enumerate(train_dataloaders):
             image_features_list = []
             image_hidden_state_list = []
@@ -376,6 +305,8 @@ def LoRA_tuning_variable_dataset(base_model,
             image_features_batch = image_features_lists[i][indices_batch]
             image_hidden_state_batch = image_hidden_state_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
+            frozen_text_features_batch = frozen_text_features_list[i][label_batch]
+            sup_con_loss.update_hard_text(frozen_init_text_features_list[i][label_batch])
             domain_batch = i % 1
 
             # def warmup_factor(epoch, warmup=20, max_factor=0.4):
@@ -387,14 +318,13 @@ def LoRA_tuning_variable_dataset(base_model,
             # max_sim_factor = warmup_factor(epoch)
 
             with autocast(device):
-                modified_text_embeddings, modified_text_hidden_states = prompt_learners[i](lora_model.text_model, domain_batch)
+                modified_text_embeddings = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
-                # text_hidden_state = modified_text_hidden_states[label_batch]
                 
-                # max_sim_factor * max_sim_loss(image_hidden_state_batch, text_hidden_state, label_batch) + \
                 loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
                         0.2 * sup_con_loss(image_hidden_state_batch, text_features, label_batch) + \
-                        1e-4 * lora_orthogonality_loss(lora_params)
+                        1e-4 * lora_orthogonality_loss(lora_params) + \
+                        F.kl_div(F.log_softmax(text_features), F.softmax(frozen_text_features_batch.detach()), reduction="batchmean")
                 total_loss += loss
 
             scaler.scale(total_loss).backward()

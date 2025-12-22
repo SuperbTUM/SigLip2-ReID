@@ -162,9 +162,11 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
         else:
             preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
         if use_ai_prompts:
-            if os.path.exists(f"prompts_{dataset_name}.txt"):
-                with open(f"prompts_{dataset_name}.txt", "r", encoding="utf-8") as f:
+            if os.path.exists(f"prompts_{dataset_name}_contrast.txt") and os.path.exists(f"prompts_{dataset_name}_full.txt"):
+                with open(f"prompts_{dataset_name}_contrast.txt", "r", encoding="utf-8") as f:
                     ai_prompts = [prompt.strip() for prompt in f.readlines()]
+                with open(f"prompts_{dataset_name}_full.txt", "r", encoding="utf-8") as f:
+                    ai_prompts += [prompt.strip() for prompt in f.readlines()]
             else:
                 ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size, dataset_name, class_name, vision_model)
         else:
