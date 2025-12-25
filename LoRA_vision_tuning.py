@@ -15,8 +15,6 @@ from typing import List, Optional
 import itertools
 from functools import partial
 
-from peft import get_peft_model, AdaLoraConfig, LoraConfig
-
 
 torch.backends.cuda.matmul.allow_tf32 = True  # on Ampere+
 torch.backends.cudnn.benchmark = True
@@ -31,11 +29,10 @@ def LoRA_vision_tuning(
         temperature,
         dataset_names,
         input_sizes,
-        device,
-        adalora=False
+        device
 ):
-    if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth"):
-        base_model, prompt_learners, temperature, _, _ = load_checkpoint(base_model, prompt_learners, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
+    if os.path.exists(f"checkpoint_epoch_120.pth"):
+        base_model, prompt_learners, temperature, _, _ = load_checkpoint(base_model, prompt_learners, None, None, f"checkpoint_epoch_120.pth", device)
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
     classifiers = []
@@ -71,48 +68,22 @@ def LoRA_vision_tuning(
 
     # --- 3. Apply PEFT to the Vision Model ---
     base_model.vision_model = base_model.vision_model.train()
-    if adalora:
-        lora_config = AdaLoraConfig(
-            target_r=16,
-            init_r=8,
-            beta1=0.85,
-            beta2=0.85,
-            tinit=num_batches * 5,
-            tfinal=num_batches * 45,
-            deltaT=num_batches * 2,
-            target_modules=["q_proj", "v_proj"],
-            bias="none",
-            total_step=num_batches * N_EPOCHS_VISION,
-            lora_dropout=0.05,
-            init_lora_weights="eva"
-        )
-    else:
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "k_proj"], # Experiment
-            lora_dropout=0.1,
-            use_dora=True,
-            init_lora_weights="eva"
-        )
+    
     # This creates the *new* trainable LoRA parameters
     if hasattr(base_model.vision_model, "peft_config"):
         del base_model.vision_model.peft_config
-    vision_model = get_peft_model(base_model.vision_model, lora_config)
+    vision_model = base_model.vision_model
     for name, param in vision_model.named_parameters():
-        if "attention_pooling" in name.lower():
-            param.requires_grad = True
-    vision_model.print_trainable_parameters()
+        param.requires_grad = True
     vision_model = vision_model.to(device)
 
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
-    sup_con_loss = HardTextQueueLoss(embedding_dim, temperature=temperature).to(device)
-    # max_sim_loss = MaxSimInfoNCE().to(device)
+    # sup_con_loss = HardTextQueueLoss(embedding_dim, temperature=temperature).to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         [
-            {'params': list(vision_model.parameters()) + list(sup_con_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': list(vision_model.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
             {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
@@ -148,10 +119,6 @@ def LoRA_vision_tuning(
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
-
-    # def fwd(x):
-    #     image_features, last_hidden_state = vision_model(pixel_values=x, interpolate_pos_encoding=False)
-    #     return image_features, last_hidden_state
     
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
@@ -164,34 +131,21 @@ def LoRA_vision_tuning(
             total_loss = 0
             i, dataloader_iter = next(round_robin_iter)
 
-            image_tensor, label, _, _, _, image_tensor_orig = next(dataloader_iter)
+            image_tensor, label, _, _, _, _ = next(dataloader_iter)
             image_tensor = image_tensor.to(device)
-            image_tensor_orig = image_tensor_orig.to(device)
             label = label.to(device)
 
             with autocast(device, torch.float16):
                 image_features, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
-                # image_features, last_hidden_state = checkpoint(fwd, image_tensor, use_reentrant=False)
                 
                 # Cross-entropy loss
                 logits = classifiers[i](image_features)
-                loss_ce = criterion[i](logits, label)
-                image_features_orig, last_hidden_state_orig = vision_model(pixel_values=image_tensor_orig, interpolate_pos_encoding=False)
-                # image_features_orig, last_hidden_state_orig = checkpoint(fwd, image_tensor_orig, use_reentrant=False)
-                
-                # Sigmoid loss
-                with torch.no_grad():
-                    text_features = modified_text_embeddings[i][label]
-                    # text_hidden_state = modified_text_hidden_states[i][label]
-                
-                # 0.4 * max_sim_loss(last_hidden_state_orig, text_hidden_state, label)
-                loss_sigmoid = sup_con_loss(image_features_orig, text_features, label) + \
-                                0.2 * sup_con_loss(last_hidden_state_orig, text_features, label)
+                loss_ce = criterion[i](logits, label) + criterion[i](image_features @ modified_text_embeddings[i].t(), label)
 
                 # Triplet loss
                 loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \
                                 mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
-                total_loss += loss_triplet + loss_ce + loss_sigmoid
+                total_loss += loss_triplet + loss_ce
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps
@@ -209,9 +163,9 @@ def LoRA_vision_tuning(
         print(f"Avg loss at epoch {epoch} is {loss_by_epoch / num_batches}.")
         torch.cuda.empty_cache()
 
-    vision_model = vision_model.merge_and_unload()
+    # vision_model = vision_model.merge_and_unload()
     base_model.vision_model = vision_model
-    save_checkpoint(base_model, prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_VISION, optimizer, scheduler)
+    save_checkpoint(base_model, prompt_learners, None, N_EPOCHS_VISION, optimizer, scheduler)
     return base_model.eval()
 
 def test(model,

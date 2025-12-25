@@ -196,10 +196,6 @@ def LoRA_tuning_variable_dataset(base_model,
     full_init_prompts = []
     n_clses = []
     all_trainable_params = list(filter(lambda p: p.requires_grad, lora_model.parameters()))
-    # for name, m in lora_model.text_model.named_modules():
-    #     if "dal" in name.lower():
-    #         for p in m.parameters():
-    #             p.requires_grad = True
     lora_params = collect_trainable_lora_As(lora_model)
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
@@ -207,8 +203,9 @@ def LoRA_tuning_variable_dataset(base_model,
         train_dataloaders.append(train_dataloader)
         n_clses.append(n_cls)
         init_prompts = ai_prompts[:(len(ai_prompts) >> 1)]
+        init_prompts_with_classname = list(map(lambda x: " ".join((class_names, x)), init_prompts))
         full_prompts.append(text_tokenizer(ai_prompts[(len(ai_prompts)>>1):], padding=True, return_tensors="pt").input_ids.to(device))
-        full_init_prompts.append(text_tokenizer(ai_prompts[:(len(ai_prompts)>>1)], padding=True, return_tensors="pt").input_ids.to(device))
+        full_init_prompts.append(text_tokenizer(init_prompts_with_classname, padding=True, return_tensors="pt").input_ids.to(device))
 
         if isinstance(class_names, str):
             class_names = [class_names] * n_cls
@@ -309,14 +306,6 @@ def LoRA_tuning_variable_dataset(base_model,
             sup_con_loss.update_hard_text(frozen_init_text_features_list[i][label_batch])
             domain_batch = i % 1
 
-            # def warmup_factor(epoch, warmup=20, max_factor=0.4):
-            #     if epoch < warmup:
-            #         return max_factor * (1 - math.exp(-epoch / (warmup/5)))
-            #     else:
-            #         return max_factor
-
-            # max_sim_factor = warmup_factor(epoch)
-
             with autocast(device):
                 modified_text_embeddings = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
@@ -324,7 +313,7 @@ def LoRA_tuning_variable_dataset(base_model,
                 loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
                         0.2 * sup_con_loss(image_hidden_state_batch, text_features, label_batch) + \
                         1e-4 * lora_orthogonality_loss(lora_params) + \
-                        F.kl_div(F.log_softmax(text_features), F.softmax(frozen_text_features_batch.detach()), reduction="batchmean")
+                        F.smooth_l1_loss(text_features, frozen_text_features_batch.detach())
                 total_loss += loss
 
             scaler.scale(total_loss).backward()
