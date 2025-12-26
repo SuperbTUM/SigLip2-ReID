@@ -55,7 +55,6 @@ class HardTextQueueLoss(nn.Module):
     @torch.no_grad()
     def update_hard_text(self, hard_text_features):
         """Manually inject hard text negatives."""
-        hard_text_features = F.normalize(hard_text_features, p=2, dim=1)
         batch_size = hard_text_features.size(0)
         ptr = int(self.queue_ptr)
         
@@ -66,98 +65,80 @@ class HardTextQueueLoss(nn.Module):
         self.queue_ptr[0] = (ptr + num_to_copy) % self.queue_size
 
     def forward(self, image_features, text_features, pid_labels):
-        # 1. L2 Normalize
         T = self.temperature.exp().clamp(0.01, 10.0)
 
-        # 2. In-batch similarity (Square matrix [B, B])
-        logits_i2t = (image_features @ text_features.t()) * T
-        logits_t2i = logits_i2t.t()
+        unique_pids, inv = torch.unique(pid_labels, return_inverse=True)
+        P = unique_pids.size(0)
+
+        class_texts = torch.zeros(
+            P, text_features.size(1),
+            device=text_features.device,
+            dtype=text_features.dtype
+        )
+        class_texts.index_add_(0, inv, text_features)
+
+        # targets: class index per image
+        targets = inv  # [B], values in [0, P-1]
+
+        # In-batch similarity (Square matrix [B, B])
+        logits_i2t = (image_features @ class_texts.t()) * T
+        logits_t2i = (class_texts @ image_features.t()) * T
         
-        # Labels for diagonal
-        labels = torch.arange(image_features.size(0), device=image_features.device)
-        
-        # Mask for samples with same PID within the batch
-        in_batch_mask = pid_labels.unsqueeze(1) == pid_labels.unsqueeze(0)
-        in_batch_mask.fill_diagonal_(False)
-        logits_i2t = logits_i2t.masked_fill(in_batch_mask, torch.finfo(logits_i2t.dtype).min)
-        logits_t2i = logits_t2i.masked_fill(in_batch_mask.t(), torch.finfo(logits_i2t.dtype).min)
+        pos_mask = unique_pids.unsqueeze(1) == pid_labels.unsqueeze(0)  # [P, B]
+        pos_logits = logits_t2i.masked_fill(~pos_mask, torch.finfo(logits_t2i.dtype).min)
+
+        log_num = torch.logsumexp(pos_logits, dim=1)     # [P]
+        log_den = torch.logsumexp(logits_t2i, dim=1)     # [P]
 
         # --- Image-to-Text (I2T) with Hard Queue ---
         if self.text_queue[0].any(): 
             logits_i2t_queue = (image_features @ self.text_queue.t()) * T
             
             # Original PID mask logic
-            queue_mask = pid_labels.unsqueeze(1) == self.queue_pids.unsqueeze(0)
-            logits_i2t_queue = logits_i2t_queue.masked_fill(queue_mask, torch.finfo(logits_i2t.dtype).min)
+            # queue_mask = pid_labels.unsqueeze(1) == self.queue_pids.unsqueeze(0)
+            # logits_i2t_queue = logits_i2t_queue.masked_fill(queue_mask, torch.finfo(logits_i2t.dtype).min)
             
             # Concatenate for I2T
             logits_i2t = torch.cat([logits_i2t, logits_i2t_queue], dim=1)
         
-        loss_i2t = F.cross_entropy(logits_i2t, labels)
+        loss_i2t = F.cross_entropy(logits_i2t, targets)
 
         # --- Text-to-Image (T2I) ---
         # Note: We only have batch images, so this is standard InfoNCE 
         # across the transposed batch matrix.
         
-        loss_t2i = F.cross_entropy(logits_t2i, labels)
+        loss_t2i = -(log_num - log_den).mean()
 
         # 3. Final Symmetric Loss
         return (loss_i2t + loss_t2i) / 2
 
-# def maxsim_similarity(image_tokens, text_tokens, temperature=1.0):
-#     # L2-normalized embeddings
-#     image_tokens = F.normalize(image_tokens, dim=-1)   # (B, I, D)
-#     text_tokens  = F.normalize(text_tokens,  dim=-1)   # (B, T, D)
-
-#     # 1. Compute similarity
-#     sim = torch.einsum("b t d, b i d -> b t i", text_tokens, image_tokens)  # (B, T, I)
-
-#     attn_weights = F.softmax(sim / temperature, dim=-1) # (B, T, I)
+def maxsim_img_loss(image_features, pid_labels, temperature=1.0):
+    """
+    image_features: [B, D] normalized
+    pid_labels: [B] long tensor
+    """
     
-#     # 4. Compute weighted score
-#     # This allows gradients to flow to ALL image tokens, proportional to their relevance.
-#     # Even background tokens get a tiny gradient signal, preventing "dead neurons".
-#     sim_smooth_max = (attn_weights * sim).sum(dim=-1) # (B, T)
+    # similarity matrix
+    sim_matrix = image_features @ image_features.t()  # [B, B]
 
-#     # 5. Aggregate
-#     score = sim_smooth_max.mean(dim=-1) # (B,)
-    
-#     return score
+    # masks
+    pid_labels = pid_labels.to(sim_matrix.device)
+    pos_mask = pid_labels.unsqueeze(0) == pid_labels.unsqueeze(1)
+    eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device)
+    pos_mask = pos_mask ^ eye.bool()  # remove diagonal
 
-# class MaxSimInfoNCE(nn.Module):
-#     def __init__(self, temperature=1.0):
-#         super().__init__()
-#         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
+    # log-sum-exp over positives
+    pos_sim = sim_matrix.masked_fill(~pos_mask, torch.finfo(image_features.dtype).min)
+    log_num = torch.logsumexp(pos_sim / temperature, dim=1)
 
-#     def forward(self, image_tokens, text_tokens, labels=None):
-#         # (B, B) similarity matrix
-#         sim = maxsim_similarity(image_tokens, text_tokens)
+    # log-sum-exp over all except self (denominator)
+    sim_matrix_no_diag = sim_matrix.masked_fill(eye.bool(), torch.finfo(image_features.dtype).min)
+    log_den = torch.logsumexp(sim_matrix_no_diag / temperature, dim=1)
 
-#         temperature = self.temperature.exp().clamp(0.01, 10.0)
-#         logits = sim * temperature
+    # MaxSim loss
+    loss = -(log_num - log_den).mean()
+    return loss
 
-#         if labels is None:
-#             targets = torch.arange(logits.size(0), device=logits.device)
-#             loss_i2t = F.cross_entropy(logits, targets)
-#             loss_t2i = F.cross_entropy(logits.t(), targets)
-#         else:
-#             labels = labels.view(-1, 1)  
-#             pos_mask = (labels == labels.t()).float() 
-#             pos_per_sample = pos_mask.sum(dim=1, keepdim=True)   # (B, 1)
-#             pos_weights = pos_mask / pos_per_sample.clamp(min=1)
-
-#             # log-softmax over candidates
-#             log_probs = F.log_softmax(logits, dim=-1)            # (B, B)
-
-#             # Multi-positive NCE: sum over positive targets
-#             loss_i2t = -(pos_weights * log_probs).sum(dim=1).mean()
-
-#             # Symmetric (text → image)
-#             log_probs_t = F.log_softmax(logits.t(), dim=-1)
-#             loss_t2i = -(pos_weights * log_probs_t).sum(dim=1).mean()
-
-#         return 0.5 * (loss_i2t + loss_t2i)
-    
 
 def mine_hard_triplets(features, labels, base_margin=0.3):
     """

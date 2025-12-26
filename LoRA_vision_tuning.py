@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import HardTextQueueLoss, mine_hard_triplets
+from losses import maxsim_img_loss, mine_hard_triplets
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -31,8 +31,8 @@ def LoRA_vision_tuning(
         input_sizes,
         device
 ):
-    if os.path.exists(f"checkpoint_epoch_120.pth"):
-        base_model, prompt_learners, temperature, _, _ = load_checkpoint(base_model, prompt_learners, None, None, f"checkpoint_epoch_120.pth", device)
+    if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth"):
+        base_model, prompt_learners, temperature, _, _ = load_checkpoint(base_model, prompt_learners, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
     classifiers = []
@@ -79,7 +79,6 @@ def LoRA_vision_tuning(
 
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
-    # sup_con_loss = HardTextQueueLoss(embedding_dim, temperature=temperature).to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         [
@@ -143,9 +142,10 @@ def LoRA_vision_tuning(
                 loss_ce = criterion[i](logits, label) + criterion[i](image_features @ modified_text_embeddings[i].t(), label)
 
                 # Triplet loss
-                loss_triplet = mine_hard_triplets(image_features, label, base_margin=0.3) + \
-                                mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
-                total_loss += loss_triplet + loss_ce
+                loss_triplet = 0.25 * mine_hard_triplets(image_features, label, base_margin=0.3) + \
+                                0.25 * mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
+                loss_maxsim = maxsim_img_loss(image_features, label)
+                total_loss += loss_triplet + loss_ce + loss_maxsim
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps
@@ -193,7 +193,7 @@ if __name__ == "__main__":
     class_names_list = ["person", "vehicle"]
     
     # Get the pre-tuned base model and prompt learners from locked image tuning
-    base_model = tuning_vision_projection(dataset_names, input_sizes, class_names_list, DEVICE)
+    base_model = tuning_vision_projection(dataset_names, input_sizes, DEVICE)
     for i, dataset_name in enumerate(dataset_names):
         cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")

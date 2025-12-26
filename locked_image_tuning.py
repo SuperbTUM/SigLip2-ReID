@@ -84,7 +84,6 @@ class PromptLearner(nn.Module):
 
 def tuning_vision_projection(dataset_names,
                              input_sizes,
-                             class_names_list,
                              device):
     base_model = model.load_weights(MODEL_NAME)
     base_model.train()
@@ -112,7 +111,7 @@ def tuning_vision_projection(dataset_names,
         all_trainable_params + list(real_sup_con_loss.parameters()), lr=1e-3, weight_decay=1e-4)
 
     train_dataloaders = []
-    for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
+    for dataset_name, input_size in zip(dataset_names, input_sizes):
         train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False)
         train_dataloaders.append(train_dataloader)
     
