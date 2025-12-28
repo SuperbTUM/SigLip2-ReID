@@ -112,32 +112,38 @@ class HardTextQueueLoss(nn.Module):
         # 3. Final Symmetric Loss
         return (loss_i2t + loss_t2i) / 2
 
-def maxsim_img_loss(image_features, pid_labels, temperature=1.0):
-    """
-    image_features: [B, D] normalized
-    pid_labels: [B] long tensor
-    """
+class MaxSimLoss(nn.Module):
+    def __init__(self, device):
+        super(MaxSimLoss, self).__init__()
+        self.temperature = nn.Parameter(torch.log(torch.tensor(0.07, device=device)))
     
-    # similarity matrix
-    sim_matrix = image_features @ image_features.t()  # [B, B]
+    def forward(self, image_features, pid_labels):
+        """
+        image_features: [B, D] normalized
+        pid_labels: [B] long tensor
+        """
+        temperature = self.temperature.exp().clamp(0.01, 10.0)
+        # similarity matrix
+        image_features = F.normalize(image_features, dim=1)
+        sim_matrix = image_features @ image_features.t() / temperature  # [B, B]
 
-    # masks
-    pid_labels = pid_labels.to(sim_matrix.device)
-    pos_mask = pid_labels.unsqueeze(0) == pid_labels.unsqueeze(1)
-    eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device)
-    pos_mask = pos_mask ^ eye.bool()  # remove diagonal
+        # masks
+        pid_labels = pid_labels.to(sim_matrix.device)
+        pos_mask = pid_labels.unsqueeze(0) == pid_labels.unsqueeze(1)
+        eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device)
+        pos_mask = pos_mask ^ eye.bool()  # remove diagonal
 
-    # log-sum-exp over positives
-    pos_sim = sim_matrix.masked_fill(~pos_mask, torch.finfo(image_features.dtype).min)
-    log_num = torch.logsumexp(pos_sim / temperature, dim=1)
+        # log-sum-exp over positives
+        pos_sim = sim_matrix.masked_fill(~pos_mask, -1e4)
+        log_num = torch.logsumexp(pos_sim, dim=1)
 
-    # log-sum-exp over all except self (denominator)
-    sim_matrix_no_diag = sim_matrix.masked_fill(eye.bool(), torch.finfo(image_features.dtype).min)
-    log_den = torch.logsumexp(sim_matrix_no_diag / temperature, dim=1)
+        # log-sum-exp over all except self (denominator)
+        sim_matrix_no_diag = sim_matrix.masked_fill(eye.bool(), -1e4)
+        log_den = torch.logsumexp(sim_matrix_no_diag, dim=1)
 
-    # MaxSim loss
-    loss = -(log_num - log_den).mean()
-    return loss
+        # MaxSim loss
+        loss = -(log_num - log_den).mean()
+        return loss
 
 
 def mine_hard_triplets(features, labels, base_margin=0.3):

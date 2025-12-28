@@ -3,7 +3,7 @@ from constants import *
 from data_preparation import *
 from checkpoint import *
 # from teacher import teacher_model_output
-from losses import SupConLoss, HardTextQueueLoss, lora_orthogonality_loss, collect_trainable_lora_As
+from losses import MaxSimLoss, HardTextQueueLoss, lora_orthogonality_loss, collect_trainable_lora_As
 
 import math
 import transformers
@@ -105,7 +105,7 @@ def tuning_vision_projection(dataset_names,
     base_model = base_model.to(device)
     all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters()))
 
-    real_sup_con_loss = SupConLoss(device)
+    real_sup_con_loss = MaxSimLoss(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         all_trainable_params + list(real_sup_con_loss.parameters()), lr=1e-3, weight_decay=1e-4)
@@ -145,7 +145,7 @@ def tuning_vision_projection(dataset_names,
             with autocast(device):
                 image_features_batch, image_last_hidden_state = base_model.get_image_features(image_tensor.to(device))
 
-                image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch, True)
+                image_contrastive_loss = real_sup_con_loss(image_features_batch, label_batch)
                 distillation_loss = 1 - (F.normalize(image_features_batch, dim=1) * F.normalize(image_last_hidden_state, dim=1)).sum(dim=-1).mean()
                 loss = image_contrastive_loss + 0.1 * distillation_loss
                 total_loss += loss
@@ -222,7 +222,6 @@ def LoRA_tuning_variable_dataset(base_model,
         all_trainable_params.extend(list(prompt_learner.parameters()))
 
     sup_con_loss = HardTextQueueLoss(embedding_dim).to(device)
-    # max_sim_loss = MaxSimInfoNCE().to(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(
         all_trainable_params + list(sup_con_loss.parameters()), lr=3.5e-3, weight_decay=1e-4)

@@ -11,7 +11,10 @@ def sample_dataset(dataset, num_pids, input_size, vision_model):
     samples = [None for _ in range(num_pids)]
     label2img = defaultdict(list)
     for data in dataset:
-        img_path, pid = data[:2]
+        img_path, pid, camid = data[:3]
+        # hacky change, in Market1501, cam6 is low-resolution
+        if input_size == (256, 128) and camid == 5:
+            continue
         label2img[pid].append(img_path)
     for pid in label2img:
         samples[pid] = random.choice(label2img[pid])

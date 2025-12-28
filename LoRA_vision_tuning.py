@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import maxsim_img_loss, mine_hard_triplets
+from losses import MaxSimLoss, mine_hard_triplets
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -66,7 +66,6 @@ def LoRA_vision_tuning(
     text_model.eval()
     text_model = text_model.to(device)
 
-    # --- 3. Apply PEFT to the Vision Model ---
     base_model.vision_model = base_model.vision_model.train()
     
     # This creates the *new* trainable LoRA parameters
@@ -80,9 +79,10 @@ def LoRA_vision_tuning(
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
     scaler = GradScaler(device)
+    max_sim_loss = MaxSimLoss(device)
     optimizer = torch.optim.Adam(
         [
-            {'params': list(vision_model.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': list(vision_model.parameters()) + list(max_sim_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
             {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
@@ -97,7 +97,7 @@ def LoRA_vision_tuning(
             return lr_factor
 
     warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-5, base_lr=5e-4))
-    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
+    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20, 30])
 
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -144,7 +144,7 @@ def LoRA_vision_tuning(
                 # Triplet loss
                 loss_triplet = 0.25 * mine_hard_triplets(image_features, label, base_margin=0.3) + \
                                 0.25 * mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
-                loss_maxsim = maxsim_img_loss(image_features, label)
+                loss_maxsim = max_sim_loss(image_features, label)
                 total_loss += loss_triplet + loss_ce + loss_maxsim
 
             # Normalize loss for accumulation
