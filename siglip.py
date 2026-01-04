@@ -4,80 +4,33 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
-class AttentionPooling(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.query = nn.Parameter(torch.zeros(dim))
-        self.scale = dim ** -0.5
-
-    def forward(self, x):  # x: [B, N, D]
-        x = F.normalize(x, dim=-1)
-        attn = (x @ self.query) * self.scale
-        attn = attn.softmax(dim=1)
-        pooled = (attn.unsqueeze(-1) * x).sum(dim=1)
-        return pooled
-
-
 class DAL(nn.Module):
     """
     Domain Adaptation Layer (DAL)
-    LN -> Linear -> GELU -> Linear -> LN
-    Outputs same dimension as input.
+    Per-dimension FiLM without projection
     """
-    def __init__(self, num_domains, hidden_size, mlp_ratio=1.0, dropout=0.0):
+    def __init__(self, num_domains, hidden_size):
         super().__init__()
-        inner = int(hidden_size * mlp_ratio)
-        self.domain_embedding = nn.Embedding(num_domains, hidden_size)
 
         # FiLM parameters
-        self.gamma = nn.Linear(hidden_size, hidden_size)
-        self.beta = nn.Linear(hidden_size, hidden_size)
-
-        self.ln1 = nn.LayerNorm(hidden_size)
-        self.fc1 = nn.Linear(hidden_size, inner)
-        self.fc2 = nn.Linear(inner, hidden_size)
-        self.ln2 = nn.LayerNorm(hidden_size)
-        self.drop = nn.Dropout(dropout)
+        self.gamma = nn.Embedding(num_domains, hidden_size)
+        self.beta = nn.Embedding(num_domains, hidden_size)
     
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Domain embedding: small, but not tiny (0.01 is correct for mid-layer DAL)
-        nn.init.normal_(self.domain_embedding.weight, std=0.01)
-
-        # FiLM starts as identity transformation:
-        # x * (1 + 0) + 0 == x
         nn.init.zeros_(self.gamma.weight)
-        nn.init.zeros_(self.gamma.bias)
-
         nn.init.zeros_(self.beta.weight)
-        nn.init.zeros_(self.beta.bias)
-
-        # MLP inside DAL should start as near-zero residual
-        # so DAL behaves like identity initially
-        nn.init.xavier_uniform_(self.fc1.weight, gain=0.1)
-        nn.init.zeros_(self.fc1.bias)
-
-        nn.init.xavier_uniform_(self.fc2.weight, gain=0.1)
-        nn.init.zeros_(self.fc2.bias)
-
-        # LayerNorm is fine with default initialization
 
     def forward(self, x, domain_ids):
         # x: (B, D)
         dtype = x.dtype
         if isinstance(domain_ids, int):
             domain_ids = torch.tensor(domain_ids, device=x.device)
-        d = self.domain_embedding(domain_ids).to(dtype)
-        gx = self.gamma(d)
-        bx = self.beta(d)
+        gx = self.gamma(domain_ids).to(dtype)
+        bx = self.beta(domain_ids).to(dtype)
         x = x * (1 + gx) + bx
-        h = self.ln1(x)
-        h = self.fc1(h)
-        h = F.gelu(h)
-        h = self.drop(h)
-        h = self.fc2(h)
-        return self.ln2(h + x)  # residual
+        return x
 
 def _prepare_4d_attention_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -502,6 +455,7 @@ class SiglipVisionTransformer(nn.Module):
         self.encoder = Siglip2Encoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self.head = SiglipMultiheadAttentionPoolingHead(config)
+        self.dal = DAL(config.num_domains, embed_dim)
 
     @staticmethod
     def convert_image_to_patches(image: torch.FloatTensor, patch_size: int) -> torch.FloatTensor:
@@ -532,7 +486,7 @@ class SiglipVisionTransformer(nn.Module):
             mask[:, -padding_length:] = 0
         return image, mask
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None, domain_ids = None) -> torch.Tensor:
         # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embedding_Dimension]
         attention_mask = None
         if self.config.version == "siglip":
@@ -547,8 +501,9 @@ class SiglipVisionTransformer(nn.Module):
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
         pooler_output = self.head(last_hidden_state)
+        pooler_output_domain = self.dal(pooler_output, domain_ids)
 
-        return pooler_output, last_hidden_state
+        return pooler_output, pooler_output_domain, last_hidden_state
 
 
 class SiglipVisionModel(nn.Module):
@@ -557,17 +512,15 @@ class SiglipVisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
-        self.attention_pooling = AttentionPooling(config.hidden_size)
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool, domain_ids: torch.Tensor) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
         bs, _, h, w = pixel_values.shape
         spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
-        pooler_output, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
-                                                             spatial_shapes=spatial_shapes)
+        pooler_output, pooler_output_domain, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
+                                                                                   spatial_shapes=spatial_shapes, domain_ids=domain_ids)
         
-        last_hidden_state = self.attention_pooling(last_hidden_state)
-        return pooler_output, last_hidden_state
+        return pooler_output, pooler_output_domain, last_hidden_state
 
 
 class SiglipTextConfig:
@@ -876,7 +829,8 @@ class SiglipModel(nn.Module):
     def get_image_features(
             self,
             pixel_values: Optional[torch.FloatTensor] = None,
-            interpolate_pos_encoding: bool = False
+            interpolate_pos_encoding: bool = False,
+            domain_ids = None
     ) -> torch.FloatTensor:
         r"""
         Returns:
@@ -886,12 +840,13 @@ class SiglipModel(nn.Module):
         ```"""
         # Use SiglipModel's config for some fields (if specified) instead of those of vision & text components.
 
-        pooled_output, last_hidden_state = self.vision_model(
+        pooled_output, pooled_output_domain, last_hidden_state = self.vision_model(
             pixel_values=pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding
+            interpolate_pos_encoding=interpolate_pos_encoding,
+            domain_ids=domain_ids
         )
 
-        return pooled_output, last_hidden_state
+        return pooled_output, pooled_output_domain, last_hidden_state
 
     def forward(
             self,

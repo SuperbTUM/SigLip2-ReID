@@ -145,7 +145,6 @@ class MaxSimLoss(nn.Module):
         loss = -(log_num - log_den).mean()
         return loss
 
-
 def mine_hard_triplets(features, labels, base_margin=0.3):
     """
     Hard triplet mining (vectorized) with base margin.
@@ -206,3 +205,46 @@ def lora_orthogonality_loss(lora_As):
         loss = loss + torch.norm(gram - I, p="fro") ** 2
 
     return loss / len(lora_As)
+
+
+class TokenMaxSimLoss(nn.Module):
+    def __init__(self, tau=0.07):
+        super().__init__()
+        self.register_buffer("temperature", torch.log(torch.tensor(tau)))
+
+    def forward(self, image_tokens, text_features, pid_labels):
+        """
+        image_tokens: [B, N, D]
+        text_features: [B, D]
+        pid_labels: [B]
+        """
+        B, N, D = image_tokens.shape
+        NEG_INF = -1e4
+
+        # Normalize
+        image_tokens = F.normalize(image_tokens, dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+
+        # Token-level similarity: [B, N, B]
+        sim = torch.einsum("bnd,cd->bnc", image_tokens, text_features)
+
+        # Max over image tokens → [B, B]
+        sim_max = sim.max(dim=1).values
+        sim_max = sim_max / self.temperature.exp().clamp(0.01, 10)
+
+        # Masks
+        pid_labels = pid_labels.to(sim_max.device)
+        pos_mask = pid_labels.unsqueeze(0) == pid_labels.unsqueeze(1)
+        eye = torch.eye(B, device=sim_max.device)
+
+        # Numerator: positives (keep diagonal)
+        pos_sim = sim_max.masked_fill(~pos_mask, NEG_INF)
+        log_num = torch.logsumexp(pos_sim, dim=1)
+
+        # Denominator: all except self
+        neg_sim = sim_max.masked_fill(eye.bool(), NEG_INF)
+        log_den = torch.logsumexp(neg_sim, dim=1)
+
+        # Final loss
+        loss = -(log_num - log_den).mean()
+        return loss

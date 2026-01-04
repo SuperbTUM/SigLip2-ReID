@@ -11,7 +11,6 @@ from base_dataset import ImageDataset
 from constants import *
 from market import Market1501
 from veri import VeRi
-from prompt_generator import get_ai_prompt_by_dataset
 
 class PKsamplerWithLabels:
     """
@@ -128,7 +127,7 @@ class RandomIdentitySampler(Sampler):
     def __len__(self):
         return self.length
 
-def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False, dual_branch=False, vision_model=None):
+def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False, dual_branch=False):
     unaugment_preprocessing = T.Compose([
             T.Resize(input_size),
             T.ToTensor(),
@@ -152,23 +151,18 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
         ])
     if dataset_name == "Market1501":
         dataset = Market1501(verbose=False)
-        class_name = "person"
     elif dataset_name == "veri":
         dataset = VeRi(verbose=False)
-        class_name = "vehicle"
     if type == "train":
         if dual_branch:
             preprocessed_dataset = ImageDataset(dataset.train, preprocessing, unaugment_preprocessing)
         else:
             preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
         if use_ai_prompts:
-            if os.path.exists(f"prompts_{dataset_name}_contrast.txt") and os.path.exists(f"prompts_{dataset_name}_full.txt"):
-                with open(f"prompts_{dataset_name}_contrast.txt", "r", encoding="utf-8") as f:
-                    ai_prompts = [prompt.strip() for prompt in f.readlines()]
+            ai_prompts = []
+            if os.path.exists(f"prompts_{dataset_name}_full.txt"):
                 with open(f"prompts_{dataset_name}_full.txt", "r", encoding="utf-8") as f:
                     ai_prompts += [prompt.strip() for prompt in f.readlines()]
-            else:
-                ai_prompts = get_ai_prompt_by_dataset(dataset.train, dataset.num_train_pids, input_size, dataset_name, class_name, vision_model)
         else:
             ai_prompts = None
     else:

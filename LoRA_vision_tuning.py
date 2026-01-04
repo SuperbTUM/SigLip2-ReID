@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import MaxSimLoss, mine_hard_triplets
+from losses import MaxSimLoss, TokenMaxSimLoss, mine_hard_triplets
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -80,9 +80,10 @@ def LoRA_vision_tuning(
     # vision_model.parameters() will *only* return the trainable LoRA parameters
     scaler = GradScaler(device)
     max_sim_loss = MaxSimLoss(device)
+    token_max_sim_loss = TokenMaxSimLoss().to(device)
     optimizer = torch.optim.Adam(
         [
-            {'params': list(vision_model.parameters()) + list(max_sim_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
+            {'params': list(vision_model.parameters()) + list(max_sim_loss.parameters()) + list(token_max_sim_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
             {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 1e-4}    # Group 2: Classifier params
         ])
 
@@ -97,7 +98,7 @@ def LoRA_vision_tuning(
             return lr_factor
 
     warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-5, base_lr=5e-4))
-    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20, 30])
+    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
 
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -135,16 +136,16 @@ def LoRA_vision_tuning(
             label = label.to(device)
 
             with autocast(device, torch.float16):
-                image_features, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
+                image_features, image_features_domain, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False, domain_ids=i)
                 
                 # Cross-entropy loss
-                logits = classifiers[i](image_features)
-                loss_ce = criterion[i](logits, label) + criterion[i](image_features @ modified_text_embeddings[i].t(), label)
+                logits = classifiers[i](image_features_domain)
+                loss_ce = criterion[i](logits, label) + criterion[i](image_features_domain @ modified_text_embeddings[i].t(), label)
 
                 # Triplet loss
                 loss_triplet = 0.25 * mine_hard_triplets(image_features, label, base_margin=0.3) + \
-                                0.25 * mine_hard_triplets(last_hidden_state, label, base_margin=0.3)
-                loss_maxsim = max_sim_loss(image_features, label)
+                                0.25 * mine_hard_triplets(image_features_domain, label, base_margin=0.3)
+                loss_maxsim = max_sim_loss(image_features, label) + max_sim_loss(image_features_domain, label) + 0.1 * token_max_sim_loss(last_hidden_state, modified_text_embeddings[i][label], label)
                 total_loss += loss_triplet + loss_ce + loss_maxsim
 
             # Normalize loss for accumulation
@@ -171,7 +172,8 @@ def LoRA_vision_tuning(
 def test(model,
          dataset_name,
          input_size,
-         device):
+         device,
+         with_domain):
     validation_dataloader, num_query, _, _ = create_dataloader(dataset_name, input_size, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     with torch.inference_mode():
@@ -181,7 +183,10 @@ def test(model,
             label = label.to(device)
             cam = cam.to(device)
             domain_ids = torch.zeros_like(label) if dataset_name == "Market1501" else torch.ones_like(label)
-            test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)[0]
+            if with_domain:
+                test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_ids=domain_ids)[1]
+            else:
+                test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_ids=domain_ids)[0]
             evaluator.update((test_feat, label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()
@@ -195,7 +200,7 @@ if __name__ == "__main__":
     # Get the pre-tuned base model and prompt learners from locked image tuning
     base_model = tuning_vision_projection(dataset_names, input_sizes, DEVICE)
     for i, dataset_name in enumerate(dataset_names):
-        cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE)
+        cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE, False)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()    
     base_model, prompt_learners, temperature = LoRA_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
@@ -204,7 +209,7 @@ if __name__ == "__main__":
     model = LoRA_vision_tuning(base_model, prompt_learners, temperature, dataset_names, input_sizes, DEVICE)
     
     for i, dataset_name in enumerate(dataset_names):
-        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE)
+        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE, True)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()
 
