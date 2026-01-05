@@ -173,7 +173,8 @@ def tuning_vision_projection(dataset_names,
                 image_contrastive_loss = real_sup_con_loss(image_features_batch, label_batch) + 0.5 * real_sup_con_loss(image_features_domain, label_batch)
                 image_text_loss = info_nce_loss(image_features_batch, frozen_text_feature.detach(), label_batch, label_batch) + info_nce_loss(frozen_text_feature.detach(), image_features_batch, label_batch, label_batch)
                 image_align_loss = F.smooth_l1_loss(image_features_domain, image_features_batch.detach())
-                loss = image_contrastive_loss + 0.1 * image_text_loss + 0.1 * image_align_loss
+                domain_contrast_loss = info_nce_loss(image_features_domain, image_features_batch.detach(), label_batch, label_batch, True)
+                loss = image_contrastive_loss + 0.1 * image_text_loss + 0.1 * image_align_loss + 0.1 * domain_contrast_loss
                 total_loss += loss
 
             scaler.scale(total_loss).backward()
@@ -313,7 +314,7 @@ def LoRA_tuning_variable_dataset(base_model,
 
             indices_batch, label_batch = next(sampler_iter)
             
-            image_features_batch = image_features_lists[i][indices_batch]
+            image_features_domain_batch = image_features_domain_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
             frozen_text_features_batch = frozen_text_features_list[i][label_batch]
             sup_con_loss.update_hard_text(frozen_text_features_batch)
@@ -323,7 +324,7 @@ def LoRA_tuning_variable_dataset(base_model,
                 modified_text_embeddings = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
                 
-                loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
+                loss = sup_con_loss(image_features_domain_batch, text_features, label_batch) + \
                         1e-4 * lora_orthogonality_loss(lora_params) + \
                         (1 - F.cosine_similarity(text_features, frozen_text_features_batch.detach(), dim=1)).mean()
                 total_loss += loss
