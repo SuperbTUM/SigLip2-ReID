@@ -173,7 +173,7 @@ def tuning_vision_projection(dataset_names,
                 image_contrastive_loss = real_sup_con_loss(image_features_batch, label_batch) + 0.5 * real_sup_con_loss(image_features_domain, label_batch)
                 image_text_loss = info_nce_loss(image_features_batch, frozen_text_feature.detach(), label_batch, label_batch) + info_nce_loss(frozen_text_feature.detach(), image_features_batch, label_batch, label_batch)
                 image_align_loss = F.smooth_l1_loss(image_features_domain, image_features_batch.detach())
-                domain_contrast_loss = info_nce_loss(image_features_domain, image_features_batch.detach(), label_batch, label_batch, True)
+                domain_contrast_loss = info_nce_loss(image_features_domain, image_features_batch.detach(), label_batch, label_batch)
                 loss = image_contrastive_loss + 0.1 * image_text_loss + 0.1 * image_align_loss + 0.1 * domain_contrast_loss
                 total_loss += loss
 
