@@ -23,7 +23,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def LoRA_vision_tuning(
+def vision_tuning(
         base_model,
         prompt_learners,
         temperature,
@@ -40,7 +40,7 @@ def LoRA_vision_tuning(
     embedding_dim = base_model.config.vision_config.hidden_size
 
     for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, dual_branch=True)
+        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
 
         # Create classifier and move to device
@@ -72,8 +72,15 @@ def LoRA_vision_tuning(
     if hasattr(base_model.vision_model, "peft_config"):
         del base_model.vision_model.peft_config
     vision_model = base_model.vision_model
+    params = []
+    base_lr = 5e-4
     for name, param in vision_model.named_parameters():
         param.requires_grad = True
+        if "bias" in name:
+            params += [{'params': [param], "lr": base_lr * 2, "weight_decay": 1e-4}]
+        else:
+            params += [{'params': [param], "lr": base_lr, "weight_decay": 1e-4}]
+    
     vision_model = vision_model.to(device)
 
     # --- 4. NOW Create the Optimizer ---
@@ -81,24 +88,17 @@ def LoRA_vision_tuning(
     scaler = GradScaler(device)
     max_sim_loss = MaxSimLoss(device)
     token_max_sim_loss = TokenMaxSimLoss().to(device)
-    optimizer = torch.optim.Adam(
-        [
-            {'params': list(vision_model.parameters()) + list(max_sim_loss.parameters()) + list(token_max_sim_loss.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},           # Group 1: LoRA params
-            {'params': classifier_params, 'lr': 5e-4, 'weight_decay': 1e-4}    # Group 2: Classifier params
-        ])
+    params += [
+        {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
+    ]
+    temperature_params = [{'params': list(max_sim_loss.parameters()) + list(token_max_sim_loss.parameters()), 'lr': base_lr}]
+    optimizer = torch.optim.Adam(params, lr=base_lr, weight_decay=1e-4)
+    temperature_optimizer = torch.optim.Adam(temperature_params, lr=base_lr)
 
     # --- 5. Schedulers and Losses ---
-    def warmup_lambda(epoch, warmup_epochs, start_lr, base_lr):
-        if epoch >= warmup_epochs:
-            return 1.0  # after warmup, multiplier = 1
-        else:
-            # linear from start_lr -> base_lr
-            # since optimizer.lr is already base_lr, scale relative to that
-            lr_factor = start_lr / base_lr + (1 - start_lr / base_lr) * (epoch / warmup_epochs)
-            return lr_factor
 
-    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=partial(warmup_lambda, warmup_epochs=5, start_lr=5e-5, base_lr=5e-4))
-    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 30, 50])
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: min((epoch + 1) / 5, 1.0))
+    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40])
 
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -123,6 +123,13 @@ def LoRA_vision_tuning(
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
         optimizer.zero_grad()
+        if epoch <= 10:
+            temperature_optimizer.zero_grad()
+        else:
+            for param in max_sim_loss.parameters():
+                param.requires_grad = False
+            for param in token_max_sim_loss.parameters():
+                param.requires_grad = False
 
         dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
         round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
@@ -131,7 +138,7 @@ def LoRA_vision_tuning(
             total_loss = 0
             i, dataloader_iter = next(round_robin_iter)
 
-            image_tensor, label, _, _, _, _ = next(dataloader_iter)
+            image_tensor, label, _, _, _ = next(dataloader_iter)
             image_tensor = image_tensor.to(device)
             label = label.to(device)
 
@@ -143,7 +150,7 @@ def LoRA_vision_tuning(
                 loss_ce = criterion[i](logits, label) + criterion[i](image_features_domain @ modified_text_embeddings[i].t(), label)
 
                 # MaxSim loss
-                loss_maxsim = max_sim_loss(image_features, label) + 0.5 * max_sim_loss(image_features_domain, label) + 0.1 * token_max_sim_loss(last_hidden_state, modified_text_embeddings[i][label], label)
+                loss_maxsim = max_sim_loss(image_features_domain, label) + 0.2 * token_max_sim_loss(last_hidden_state, modified_text_embeddings[i][label], label)
                 total_loss += loss_ce + loss_maxsim
 
             # Normalize loss for accumulation
@@ -153,8 +160,11 @@ def LoRA_vision_tuning(
 
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
+                if epoch <= 10:
+                    scaler.step(temperature_optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                temperature_optimizer.zero_grad()
             
             loss_by_epoch += total_loss.item() * accumulation_steps
 
@@ -204,7 +214,7 @@ if __name__ == "__main__":
     base_model, prompt_learners, temperature = LoRA_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
 
     # Run LoRA vision tuning
-    model = LoRA_vision_tuning(base_model, prompt_learners, temperature, dataset_names, input_sizes, DEVICE)
+    model = vision_tuning(base_model, prompt_learners, temperature, dataset_names, input_sizes, DEVICE)
     
     for i, dataset_name in enumerate(dataset_names):
         cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE, True)

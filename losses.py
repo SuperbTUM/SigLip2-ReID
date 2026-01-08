@@ -41,7 +41,7 @@ class SupConLoss(nn.Module):
 class HardTextQueueLoss(nn.Module):
     def __init__(self, 
                  feature_dim: int, 
-                 queue_size: int = 32,
+                 queue_size: int = 64,
                  temperature: float = 1.0):
         super().__init__()
         self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
@@ -248,3 +248,34 @@ class TokenMaxSimLoss(nn.Module):
         # Final loss
         loss = -(log_num - log_den).mean()
         return loss
+
+def compute_centroids(features: torch.Tensor,
+                      labels: torch.Tensor,
+                      normalize: bool = True):
+    """
+    features: [B, D] tensor
+    labels:   [B] long tensor
+    normalize: whether to L2-normalize centroids
+
+    returns:
+        centroids: [C_batch, D]  (one per unique label in the batch)
+        uniq_labels: [C_batch]   (labels corresponding to centroids)
+    """
+    device = features.device
+    labels = labels.to(device)
+
+    uniq_labels = labels.unique(sorted=True)
+    centroids = []
+
+    for lbl in uniq_labels:
+        mask = labels == lbl
+        if mask.any():
+            c = features[mask].mean(dim=0)
+            centroids.append(c)
+
+    centroids = torch.stack(centroids, dim=0)
+
+    if normalize:
+        centroids = F.normalize(centroids, dim=-1)
+
+    return centroids
