@@ -55,9 +55,9 @@ class PromptLearner(nn.Module):
             ai_text_embedding = token_embedding(ai_text_inputs)[:, 1:, :]
         
         # Initialize the learnable prompt vectors
-        init_prompt = torch.randn(len(class_names), num_prompt_tokens, embedding_dim, dtype=ai_text_embedding.dtype)
+        init_prompt = torch.randn(len(class_names), num_prompt_tokens, embedding_dim, dtype=ai_text_embedding.dtype, device=device)
         nn.init.normal_(init_prompt, std=0.02)
-        self.prompt = nn.Parameter(init_prompt).to(device)
+        self.prompt = nn.Parameter(init_prompt)
 
         self.register_buffer("class_name_embedding", class_embedding)
         self.register_buffer("ai_text_embedding", ai_text_embedding)
@@ -202,12 +202,11 @@ def LoRA_tuning_variable_dataset(base_model,
     if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth"):
         base_model, _, _, _, _ = load_checkpoint(base_model, None, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
-    frozen_text_model = copy.deepcopy(base_model.text_model.eval())
     lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
+        r=4,
+        lora_alpha=8,
         target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.1,
+        lora_dropout=0.0,
         bias="none",
         use_dora=True,
         init_lora_weights="pissa_niter_4"
@@ -224,7 +223,8 @@ def LoRA_tuning_variable_dataset(base_model,
     prompt_learners = []
     full_prompts = []
     n_clses = []
-    all_trainable_params = list(filter(lambda p: p.requires_grad, lora_model.parameters()))
+    text_encoder_params = list(filter(lambda p: p.requires_grad, lora_model.parameters()))
+    prompt_learner_params = []
     lora_params = collect_trainable_lora_As(lora_model)
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
@@ -245,24 +245,32 @@ def LoRA_tuning_variable_dataset(base_model,
             class_names=class_names
         )
         prompt_learners.append(prompt_learner)
-        all_trainable_params.extend(list(prompt_learner.parameters()))
+        prompt_learner_params.extend(list(prompt_learner.parameters()))
 
     sup_con_loss = HardTextQueueLoss(embedding_dim).to(device)
     scaler = GradScaler(device)
-    optimizer = torch.optim.Adam(
-        all_trainable_params, lr=3.5e-3, weight_decay=1e-4)
-    temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=3.5e-3)
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,      
-        end_factor=1.0,
-        total_iters=10
+    text_encoder_optimizer = torch.optim.Adam(
+        text_encoder_params, lr=3.5e-3, weight_decay=1e-4)
+    prompt_learner_optimizer = torch.optim.Adam(
+        prompt_learner_params, lr=3.5e-3, weight_decay=1e-4
     )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS_LoRA-10, eta_min=1e-6)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[10]
+    temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=3.5e-3)
+
+    prompt_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        prompt_learner_optimizer,
+        schedulers=[
+            torch.optim.lr_scheduler.LinearLR(
+                prompt_learner_optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=5
+            ),
+            torch.optim.lr_scheduler.LambdaLR(
+                prompt_learner_optimizer,
+                lr_lambda=lambda _: 1.0
+            )
+        ],
+        milestones=[5]
     )
     
     # --- Pre-extract image features for all datasets ---
@@ -300,24 +308,43 @@ def LoRA_tuning_variable_dataset(base_model,
 
     for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
-        if epoch % 10 == 0:
-            with torch.inference_mode():
-                batch_size = 32
-                frozen_text_features_list = []
-                for j, n_cls in enumerate(n_clses):
-                    frozen_text_feature_list = []
-                    for i in range(0, n_cls, batch_size):
-                        text_features = frozen_text_model(full_prompts[j][i:i+batch_size])
-                        frozen_text_feature_list.append(text_features)
-                    frozen_text_features_list.append(torch.cat(frozen_text_feature_list, dim=0))
+
+        with torch.inference_mode():
+            batch_size = 32
+            frozen_text_features_list = []
+            for j, n_cls in enumerate(n_clses):
+                frozen_text_feature_list = []
+                for i in range(0, n_cls, batch_size):
+                    text_features = lora_model.text_model(full_prompts[j][i:i+batch_size])
+                    frozen_text_feature_list.append(text_features)
+                frozen_text_features_list.append(torch.cat(frozen_text_feature_list, dim=0))
 
         # Create cyclic iterators
         sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
+        if epoch == 10:
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                text_encoder_optimizer,
+                schedulers=[
+                    torch.optim.lr_scheduler.LinearLR(
+                        text_encoder_optimizer,
+                        start_factor=0.1,      
+                        end_factor=1.0,
+                        total_iters=10
+                    ), 
+                    torch.optim.lr_scheduler.CosineAnnealingLR(
+                        text_encoder_optimizer, 
+                        T_max=N_EPOCHS_LoRA-20, 
+                        eta_min=1e-6)
+                ],
+                milestones=[10]
+            )
         
         for step, (i, sampler_iter) in enumerate(itertools.cycle(enumerate(sampler_iters))):
             if step >= num_batches:  # stop after desired batches
                 break
-            optimizer.zero_grad()
+            if epoch >= 10:
+                text_encoder_optimizer.zero_grad()
+            prompt_learner_optimizer.zero_grad()
             temperature_optimizer.zero_grad()
             total_loss = 0
 
@@ -339,17 +366,21 @@ def LoRA_tuning_variable_dataset(base_model,
                 total_loss += loss
 
             scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
+            if epoch >= 10:
+                scaler.step(text_encoder_optimizer)
+            scaler.step(prompt_learner_optimizer)
             scaler.step(temperature_optimizer)
             scaler.update()
             loss_by_epoch += total_loss.item()
-        scheduler.step()
+        if epoch >= 10:
+            scheduler.step()
+        prompt_scheduler.step()
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     
     base_model.text_model = lora_model.text_model.merge_and_unload()
     for prompt_learner in prompt_learners:
         prompt_learner.eval()
-    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, optimizer, scheduler)
+    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, text_encoder_optimizer, scheduler)
     return base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item()
 

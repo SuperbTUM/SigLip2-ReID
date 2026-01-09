@@ -50,7 +50,7 @@ def vision_tuning(
             nn.Linear(embedding_dim, n_cls, bias=False),
         ).to(device)
         classifier[0].bias.requires_grad_(False)
-        nn.init.normal_(classifier[1].weight, std=0.001)
+        nn.init.normal_(classifier[1].weight, std=0.01)
         classifiers.append(classifier)
         
         # Add its parameters to the list
