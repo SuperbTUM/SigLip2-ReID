@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import MaxSimLoss, TokenMaxSimLoss, mine_hard_triplets
+from losses import SupConLoss, MaxSimLoss, TokenMaxSimLoss, compute_centroids
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -86,12 +86,13 @@ def vision_tuning(
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
     scaler = GradScaler(device)
+    info_nce_loss = SupConLoss(device)
     max_sim_loss = MaxSimLoss(device)
     token_max_sim_loss = TokenMaxSimLoss().to(device)
     params += [
         {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
     ]
-    temperature_params = [{'params': list(max_sim_loss.parameters()) + list(token_max_sim_loss.parameters()), 'lr': base_lr}]
+    temperature_params = [{'params': list(max_sim_loss.parameters()) + list(token_max_sim_loss.parameters()) + list(info_nce_loss.parameters()), 'lr': base_lr}]
     optimizer = torch.optim.Adam(params, lr=base_lr, weight_decay=1e-4)
     temperature_optimizer = torch.optim.Adam(temperature_params, lr=base_lr)
 
@@ -145,13 +146,17 @@ def vision_tuning(
             with autocast(device, torch.float16):
                 image_features, image_features_domain, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False, domain_ids=i)
                 
+                image_features_centroid = compute_centroids(image_features, label, True)
+                image_features_domain_centroid = compute_centroids(image_features_domain, label, True)
+                image_align_loss = (1 - (image_features_centroid.detach() * image_features_domain_centroid).sum(dim=1)).mean()
+                domain_contrast_loss = info_nce_loss(image_features_domain, image_features.detach(), label, label)
                 # Cross-entropy loss
                 logits = classifiers[i](image_features_domain)
                 loss_ce = criterion[i](logits, label) + criterion[i](image_features_domain @ modified_text_embeddings[i].t(), label)
 
                 # MaxSim loss
                 loss_maxsim = max_sim_loss(image_features_domain, label) + 0.2 * token_max_sim_loss(last_hidden_state, modified_text_embeddings[i][label], label)
-                total_loss += loss_ce + loss_maxsim
+                total_loss += loss_ce + loss_maxsim + 0.1 * image_align_loss + 0.1 * domain_contrast_loss
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps

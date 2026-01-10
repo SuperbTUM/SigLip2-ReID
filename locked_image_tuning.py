@@ -3,7 +3,7 @@ from constants import *
 from data_preparation import *
 from checkpoint import *
 # from teacher import teacher_model_output
-from losses import MaxSimLoss, HardTextQueueLoss, lora_orthogonality_loss, collect_trainable_lora_As, SupConLoss, compute_centroids
+from losses import MaxSimLoss, HardTextQueueLoss, lora_orthogonality_loss, collect_trainable_lora_As, SupConLoss
 
 import math
 import transformers
@@ -71,14 +71,6 @@ class PromptLearner(nn.Module):
         # [PROMPT, PROMPT, ..., CLASS_NAME]
         combined_embs = torch.cat([self.class_name_embedding, self.prompt], dim=1)
         
-        # Pass the combined embeddings through the rest of the text encoder
-        # This part requires a custom forward pass through the text model layers
-        # For simplicity, we assume we can pass embeddings directly. 
-        # In transformers, you pass it to the encoder layers.
-        
-        # A simplified representation of passing through the encoder:
-        # Note: The actual `transformers` implementation requires passing embeddings
-        # through `model.text_model.encoder` and then `model.text_model.final_layer_norm`.
         prompted_text_features = text_model(inputs_embeds=combined_embs, domain_ids=domain_ids)
         
         return prompted_text_features
@@ -112,7 +104,7 @@ def tuning_vision_projection(dataset_names,
         param.requires_grad = False
     for name, param in base_model.vision_model.named_parameters():
         if "dal" in name.lower():
-            param.requires_grad = True
+            param.requires_grad = False
     base_model = base_model.to(device)
     all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters()))
 
@@ -169,15 +161,12 @@ def tuning_vision_projection(dataset_names,
             frozen_text_feature = frozen_text_features_list[i][label_batch]
 
             with autocast(device):
-                image_features_batch, image_features_domain = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[:2]
-                image_features_batch_centroid = compute_centroids(image_features_batch, label_batch, False)
-                image_features_domain_centroid = compute_centroids(image_features_domain, label_batch, False)
+                image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
                 
-                image_contrastive_loss = real_sup_con_loss(image_features_domain, label_batch)
-                image_text_loss = info_nce_loss(image_features_domain, frozen_text_feature.detach(), label_batch, label_batch)
-                image_align_loss = F.smooth_l1_loss(image_features_batch_centroid.detach(), image_features_domain_centroid)
-                domain_contrast_loss = info_nce_loss(image_features_domain, image_features_batch.detach(), label_batch, label_batch)
-                loss = image_contrastive_loss + 0.1 * image_text_loss + 0.1 * image_align_loss + 0.1 * domain_contrast_loss
+                image_contrastive_loss = real_sup_con_loss(image_features_batch, label_batch)
+                image_text_loss = info_nce_loss(image_features_batch, frozen_text_feature.detach(), label_batch, label_batch)
+
+                loss = image_contrastive_loss + 0.1 * image_text_loss 
                 total_loss += loss
 
             scaler.scale(total_loss).backward()
@@ -275,25 +264,20 @@ def LoRA_tuning_variable_dataset(base_model,
     
     # --- Pre-extract image features for all datasets ---
     image_features_lists = []
-    image_features_domain_lists = []
     image_label_lists = []
-    frozen_text_features_list = []
     with torch.inference_mode():
         for i, train_dataloader in enumerate(train_dataloaders):
             image_features_list = []
-            image_features_domain_list = []
             image_label_list = []
             for batch in train_dataloader:
                 image_tensor, label = batch[:2]
                 image_tensor = image_tensor.to(device)
                 label = label.to(device)
                 domain_ids = i
-                image_features, image_features_domain = lora_model.get_image_features(image_tensor, domain_ids=domain_ids)[:2]
+                image_features = lora_model.get_image_features(image_tensor, domain_ids=domain_ids)[0]
                 image_features_list.append(image_features)
-                image_features_domain_list.append(image_features_domain)
                 image_label_list.append(label)
             image_features_lists.append(torch.cat(image_features_list, dim=0))
-            image_features_domain_lists.append(torch.cat(image_features_domain_list, dim=0))
             image_label_lists.append(torch.cat(image_label_list, dim=0))
         # teacher_model_outputs = teacher_model_output(train_dataloaders, ai_prompts)
     # --- Samplers for each dataset ---
@@ -350,7 +334,7 @@ def LoRA_tuning_variable_dataset(base_model,
 
             indices_batch, label_batch = next(sampler_iter)
             
-            image_features_domain_batch = image_features_domain_lists[i][indices_batch]
+            image_features_batch = image_features_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
             frozen_text_features_batch = frozen_text_features_list[i][label_batch]
             sup_con_loss.update_hard_text(frozen_text_features_batch)
@@ -360,7 +344,7 @@ def LoRA_tuning_variable_dataset(base_model,
                 modified_text_embeddings = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
                 
-                loss = sup_con_loss(image_features_domain_batch, text_features, label_batch) + \
+                loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
                         1e-4 * lora_orthogonality_loss(lora_params) + \
                         (1 - F.cosine_similarity(text_features, frozen_text_features_batch.detach(), dim=1)).mean()
                 total_loss += loss
