@@ -2,18 +2,15 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import SupConLoss, MaxSimLoss, TokenMaxSimLoss, compute_centroids
+from losses import SupConLoss, MaxSimLoss, TokenMaxSimLoss, compute_centroids, mine_hard_triplets
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from torch.utils.checkpoint import checkpoint
 from torch.amp import autocast, GradScaler
-from typing import List, Optional
 import itertools
-from functools import partial
 
 
 torch.backends.cuda.matmul.allow_tf32 = True  # on Ampere+
@@ -56,7 +53,7 @@ def vision_tuning(
         # Add its parameters to the list
         classifier_params.extend(list(classifier.parameters()))
 
-    num_batches = max(len(loader) for loader in train_dataloaders)
+    num_batches = max(len(loader) for loader in train_dataloaders) * len(train_dataloaders)
 
     # --- 2. Freeze Text Model ---
     # (Do this early, it doesn't affect the optimizer)
@@ -89,6 +86,7 @@ def vision_tuning(
     info_nce_loss = SupConLoss(device)
     max_sim_loss = MaxSimLoss(device)
     token_max_sim_loss = TokenMaxSimLoss().to(device)
+    criterion = [nn.CrossEntropyLoss(label_smoothing=0.05).to(device), nn.CrossEntropyLoss(label_smoothing=0.1).to(device)]
     params += [
         {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
     ]
@@ -98,15 +96,14 @@ def vision_tuning(
 
     # --- 5. Schedulers and Losses ---
 
-    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: min((epoch + 1) / 5, 1.0))
-    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40])
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: min((epoch + 1) / 10, 1.0))
+    multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 50])
 
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, multistep_scheduler],
-        milestones=[5]
+        milestones=[10]
     )
-    criterion = [nn.CrossEntropyLoss(label_smoothing=0.05).to(device), nn.CrossEntropyLoss(label_smoothing=0.1).to(device)]
 
     # --- Freeze prompt learners ---
     modified_text_embeddings = []
@@ -154,9 +151,11 @@ def vision_tuning(
                 logits = classifiers[i](image_features_domain)
                 loss_ce = criterion[i](logits, label) + criterion[i](image_features_domain @ modified_text_embeddings[i].t(), label)
 
+                loss_triplet = mine_hard_triplets(image_features_domain, label)
+
                 # MaxSim loss
                 loss_maxsim = max_sim_loss(image_features_domain, label) + 0.2 * token_max_sim_loss(last_hidden_state, modified_text_embeddings[i][label], label)
-                total_loss += loss_ce + loss_maxsim + 0.1 * image_align_loss + 0.1 * domain_contrast_loss
+                total_loss += loss_ce + loss_maxsim + 0.1 * image_align_loss + 0.1 * domain_contrast_loss + loss_triplet
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps

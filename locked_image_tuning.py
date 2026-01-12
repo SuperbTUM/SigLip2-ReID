@@ -108,11 +108,11 @@ def tuning_vision_projection(dataset_names,
     base_model = base_model.to(device)
     all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters()))
 
-    real_sup_con_loss = MaxSimLoss(device)
-    info_nce_loss = SupConLoss(device)
+    max_sim_loss = MaxSimLoss(device)
+    real_sup_con_loss = SupConLoss(device)
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(all_trainable_params, lr=1e-3, weight_decay=1e-4)
-    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-3)
+    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(max_sim_loss.parameters()), lr=1e-3)
 
     train_dataloaders = []
     n_clses = []
@@ -132,7 +132,7 @@ def tuning_vision_projection(dataset_names,
             frozen_text_features_list.append(torch.cat(frozen_text_feature_list, dim=0))
     
     # --- Training Loop ---
-    num_batches = max(len(loader) for loader in train_dataloaders)
+    num_batches = max(len(loader) for loader in train_dataloaders) * len(train_dataloaders)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=2e-3,
@@ -163,8 +163,8 @@ def tuning_vision_projection(dataset_names,
             with autocast(device):
                 image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
                 
-                image_contrastive_loss = real_sup_con_loss(image_features_batch, label_batch)
-                image_text_loss = info_nce_loss(image_features_batch, frozen_text_feature.detach(), label_batch, label_batch)
+                image_contrastive_loss = max_sim_loss(image_features_batch, label_batch) + real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch, True)
+                image_text_loss = real_sup_con_loss(image_features_batch, frozen_text_feature.detach(), label_batch, label_batch)
 
                 loss = image_contrastive_loss + 0.1 * image_text_loss 
                 total_loss += loss
@@ -191,6 +191,7 @@ def LoRA_tuning_variable_dataset(base_model,
     if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth"):
         base_model, _, _, _, _ = load_checkpoint(base_model, None, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
+    frozen_text_model = copy.deepcopy(base_model.text_model)
     lora_config = LoraConfig(
         r=4,
         lora_alpha=8,
@@ -239,11 +240,11 @@ def LoRA_tuning_variable_dataset(base_model,
     sup_con_loss = HardTextQueueLoss(embedding_dim).to(device)
     scaler = GradScaler(device)
     text_encoder_optimizer = torch.optim.Adam(
-        text_encoder_params, lr=3.5e-3, weight_decay=1e-4)
+        text_encoder_params, lr=3.5e-4, weight_decay=1e-4)
     prompt_learner_optimizer = torch.optim.Adam(
-        prompt_learner_params, lr=3.5e-3, weight_decay=1e-4
+        prompt_learner_params, lr=5e-4, weight_decay=1e-4
     )
-    temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=3.5e-3)
+    temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=1e-3)
 
     prompt_scheduler = torch.optim.lr_scheduler.SequentialLR(
         prompt_learner_optimizer,
@@ -265,7 +266,15 @@ def LoRA_tuning_variable_dataset(base_model,
     # --- Pre-extract image features for all datasets ---
     image_features_lists = []
     image_label_lists = []
+    frozen_text_features_list = []
     with torch.inference_mode():
+        batch_size = 32
+        for j, n_cls in enumerate(n_clses):
+            frozen_text_feature_list = []
+            for i in range(0, n_cls, batch_size):
+                text_features = frozen_text_model(full_prompts[j][i:i+batch_size])
+                frozen_text_feature_list.append(text_features)
+            frozen_text_features_list.append(torch.cat(frozen_text_feature_list, dim=0))
         for i, train_dataloader in enumerate(train_dataloaders):
             image_features_list = []
             image_label_list = []
@@ -288,20 +297,10 @@ def LoRA_tuning_variable_dataset(base_model,
     
     # --- Training Loop ---
     # Use itertools.cycle to handle datasets of different sizes
-    num_batches = max(len(sampler) for sampler in pk_samplers)
+    num_batches = max(len(sampler) for sampler in pk_samplers) * len(train_dataloaders)
 
     for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
-
-        with torch.inference_mode():
-            batch_size = 32
-            frozen_text_features_list = []
-            for j, n_cls in enumerate(n_clses):
-                frozen_text_feature_list = []
-                for i in range(0, n_cls, batch_size):
-                    text_features = lora_model.text_model(full_prompts[j][i:i+batch_size])
-                    frozen_text_feature_list.append(text_features)
-                frozen_text_features_list.append(torch.cat(frozen_text_feature_list, dim=0))
 
         # Create cyclic iterators
         sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]

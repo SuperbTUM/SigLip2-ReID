@@ -1,4 +1,3 @@
-import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -210,7 +209,7 @@ def lora_orthogonality_loss(lora_As):
 class TokenMaxSimLoss(nn.Module):
     def __init__(self, tau=0.07):
         super().__init__()
-        self.register_buffer("temperature", torch.log(torch.tensor(tau)))
+        self.temperature = nn.Parameter(torch.log(torch.tensor(tau)))
 
     def forward(self, image_tokens, text_features, pid_labels):
         """
