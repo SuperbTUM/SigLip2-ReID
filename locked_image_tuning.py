@@ -3,9 +3,8 @@ from constants import *
 from data_preparation import *
 from checkpoint import *
 # from teacher import teacher_model_output
-from losses import MaxSimLoss, HardTextQueueLoss, lora_orthogonality_loss, collect_trainable_lora_As, SupConLoss
+from losses import MMSupConAndProxyCE, lora_orthogonality_loss, collect_trainable_lora_As, SupConLoss
 
-import math
 import transformers
 import torch
 import torch.nn as nn
@@ -97,7 +96,7 @@ def tuning_vision_projection(dataset_names,
         lora_dropout=0.1,
         bias="none",
         use_dora=True,
-        init_lora_weights="pissa_niter_4"
+        init_lora_weights="pissa_niter_8"
     )
     base_model.vision_model = get_peft_model(base_model.vision_model, lora_config)
     for param in base_model.text_model.parameters():
@@ -108,11 +107,11 @@ def tuning_vision_projection(dataset_names,
     base_model = base_model.to(device)
     all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters()))
 
-    max_sim_loss = MaxSimLoss(device)
     real_sup_con_loss = SupConLoss(device)
+    info_nce_loss = MMSupConAndProxyCE()
     scaler = GradScaler(device)
     optimizer = torch.optim.Adam(all_trainable_params, lr=1e-3, weight_decay=1e-4)
-    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(max_sim_loss.parameters()), lr=1e-3)
+    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-3)
 
     train_dataloaders = []
     n_clses = []
@@ -162,12 +161,13 @@ def tuning_vision_projection(dataset_names,
 
             with autocast(device):
                 image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
-                
-                image_contrastive_loss = max_sim_loss(image_features_batch, label_batch) + real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch, True)
-                image_text_loss = real_sup_con_loss(image_features_batch, frozen_text_feature.detach(), label_batch, label_batch)
+            
+            image_features_batch = image_features_batch.float()
+            image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch, True)
+            image_text_loss = info_nce_loss(image_features_batch, frozen_text_feature.detach(), label_batch, None, False)
 
-                loss = image_contrastive_loss + 0.1 * image_text_loss 
-                total_loss += loss
+            loss = image_contrastive_loss + 0.1 * image_text_loss 
+            total_loss += loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -193,8 +193,8 @@ def LoRA_tuning_variable_dataset(base_model,
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
     frozen_text_model = copy.deepcopy(base_model.text_model)
     lora_config = LoraConfig(
-        r=4,
-        lora_alpha=8,
+        r=8,
+        lora_alpha=16,
         target_modules=["q_proj", "v_proj"],
         lora_dropout=0.0,
         bias="none",
@@ -237,7 +237,7 @@ def LoRA_tuning_variable_dataset(base_model,
         prompt_learners.append(prompt_learner)
         prompt_learner_params.extend(list(prompt_learner.parameters()))
 
-    sup_con_loss = HardTextQueueLoss(embedding_dim).to(device)
+    sup_con_loss = MMSupConAndProxyCE()
     scaler = GradScaler(device)
     text_encoder_optimizer = torch.optim.Adam(
         text_encoder_params, lr=3.5e-4, weight_decay=1e-4)
@@ -336,17 +336,17 @@ def LoRA_tuning_variable_dataset(base_model,
             image_features_batch = image_features_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
             frozen_text_features_batch = frozen_text_features_list[i][label_batch]
-            sup_con_loss.update_hard_text(frozen_text_features_batch)
             domain_batch = i % 1
 
             with autocast(device):
                 modified_text_embeddings = prompt_learners[i](lora_model.text_model, domain_batch)
                 text_features = modified_text_embeddings[label_batch]
-                
-                loss = sup_con_loss(image_features_batch, text_features, label_batch) + \
-                        1e-4 * lora_orthogonality_loss(lora_params) + \
-                        (1 - F.cosine_similarity(text_features, frozen_text_features_batch.detach(), dim=1)).mean()
-                total_loss += loss
+            
+            text_features = text_features.float()
+            loss = sup_con_loss(image_features_batch, text_features, label_batch, frozen_text_features_batch, False) + \
+                    1e-4 * lora_orthogonality_loss(lora_params) + \
+                    (1 - F.cosine_similarity(text_features, frozen_text_features_batch.detach(), dim=1)).mean()
+            total_loss += loss
 
             scaler.scale(total_loss).backward()
             if epoch >= 10:
@@ -364,6 +364,6 @@ def LoRA_tuning_variable_dataset(base_model,
     base_model.text_model = lora_model.text_model.merge_and_unload()
     for prompt_learner in prompt_learners:
         prompt_learner.eval()
-    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, text_encoder_optimizer, scheduler)
-    return base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item()
+    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.log_temperature.exp().item(), N_EPOCHS_LoRA, text_encoder_optimizer, scheduler)
+    return base_model.eval(), prompt_learners, sup_con_loss.log_temperature.exp().item()
 

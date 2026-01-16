@@ -37,112 +37,170 @@ class SupConLoss(nn.Module):
 
         return loss
 
-class HardTextQueueLoss(nn.Module):
-    def __init__(self, 
-                 feature_dim: int, 
-                 queue_size: int = 64,
-                 temperature: float = 1.0):
+class MMSupConAndProxyCE(nn.Module):
+    """
+    Two losses:
+      (1) L_mm_supcon: supervised contrastive over anchors Z = [images ; class_text_proxies]
+          positives = same class (image-image, image-proxy, proxy-image)
+          + optional per-class near-miss negative in denominator
+
+      (2) L_proxy_ce: image -> class proxy CE
+          + optional per-class near-miss negative as an extra logit
+
+    Inputs:
+      image_features: [B, D]
+      text_features:  [B, D]  (soft prompt embedding per image; duplicated per class with PK)
+      pid_labels:     [B]
+      near_miss_features: optional [B, D] (near-miss prompt embedding per image; duplicated per class)
+    """
+
+    def __init__(self, temperature: float = 0.07, alpha_proxy_ce: float = 0.1):
         super().__init__()
-        self.temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
-        self.queue_size = queue_size
+        self.log_temperature = nn.Parameter(torch.log(torch.tensor(float(temperature))))
+        self.alpha_proxy_ce = alpha_proxy_ce
 
-        # --- Only Text Queue (for hard negatives) ---
-        self.register_buffer("text_queue", torch.zeros(queue_size, feature_dim))
-        self.register_buffer("queue_pids", torch.ones(queue_size, dtype=torch.long) * -1)
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+    def _T(self) -> torch.Tensor:
+        return self.log_temperature.exp().clamp(0.01, 1.0)  # logits = sim / T
 
-    @torch.no_grad()
-    def update_hard_text(self, hard_text_features):
-        """Manually inject hard text negatives."""
-        batch_size = hard_text_features.size(0)
-        ptr = int(self.queue_ptr)
-        
-        num_to_copy = min(batch_size, self.queue_size - ptr)
-        self.text_queue[ptr:ptr+num_to_copy, :] = hard_text_features[:num_to_copy]
-        self.queue_pids[ptr:ptr+num_to_copy] = -1
-            
-        self.queue_ptr[0] = (ptr + num_to_copy) % self.queue_size
+    @staticmethod
+    def _mean_by_class(features: torch.Tensor, pid_labels: torch.Tensor):
+        """
+        Mean-pool features per class in the batch.
 
-    def forward(self, image_features, text_features, pid_labels):
-        T = self.temperature.exp().clamp(0.01, 10.0)
-
+        Returns:
+          unique_pids: [P]
+          class_feats: [P, D]
+          inv:         [B] in 0..P-1
+        """
         unique_pids, inv = torch.unique(pid_labels, return_inverse=True)
-        P = unique_pids.size(0)
+        P, D = unique_pids.size(0), features.size(1)
 
-        class_texts = torch.zeros(
-            P, text_features.size(1),
-            device=text_features.device,
-            dtype=text_features.dtype
-        )
-        class_texts.index_add_(0, inv, text_features)
+        class_feats = torch.zeros(P, D, device=features.device, dtype=features.dtype)
+        class_feats.index_add_(0, inv, features)
 
-        # targets: class index per image
-        targets = inv  # [B], values in [0, P-1]
+        counts = torch.bincount(inv, minlength=P).to(features.device).clamp_min(1).unsqueeze(1)
+        class_feats = class_feats / counts
+        return unique_pids, class_feats, inv
 
-        # In-batch similarity (Square matrix [B, B])
-        logits_i2t = (image_features @ class_texts.t()) * T
-        logits_t2i = (class_texts @ image_features.t()) * T
-        
-        pos_mask = unique_pids.unsqueeze(1) == pid_labels.unsqueeze(0)  # [P, B]
-        pos_logits = logits_t2i.masked_fill(~pos_mask, torch.finfo(logits_t2i.dtype).min)
-
-        log_num = torch.logsumexp(pos_logits, dim=1)     # [P]
-        log_den = torch.logsumexp(logits_t2i, dim=1)     # [P]
-
-        # --- Image-to-Text (I2T) with Hard Queue ---
-        if self.text_queue[0].any(): 
-            logits_i2t_queue = (image_features @ self.text_queue.t()) * T
-            
-            # Original PID mask logic
-            # queue_mask = pid_labels.unsqueeze(1) == self.queue_pids.unsqueeze(0)
-            # logits_i2t_queue = logits_i2t_queue.masked_fill(queue_mask, torch.finfo(logits_i2t.dtype).min)
-            
-            # Concatenate for I2T
-            logits_i2t = torch.cat([logits_i2t, logits_i2t_queue], dim=1)
-        
-        loss_i2t = F.cross_entropy(logits_i2t, targets)
-
-        # --- Text-to-Image (T2I) ---
-        # Note: We only have batch images, so this is standard InfoNCE 
-        # across the transposed batch matrix.
-        
-        loss_t2i = -(log_num - log_den).mean()
-
-        # 3. Final Symmetric Loss
-        return (loss_i2t + loss_t2i) / 2
-
-class MaxSimLoss(nn.Module):
-    def __init__(self, device):
-        super(MaxSimLoss, self).__init__()
-        self.temperature = nn.Parameter(torch.log(torch.tensor(0.07, device=device)))
-    
-    def forward(self, image_features, pid_labels):
+    @staticmethod
+    def _supcon_loss(logits: torch.Tensor, pos_mask: torch.Tensor, extra_den_logits: torch.Tensor | None = None):
         """
-        image_features: [B, D] normalized
-        pid_labels: [B] long tensor
+        logits: [N, N] anchor-to-anchor logits
+        pos_mask: [N, N] True where positive (excluding self)
+        extra_den_logits: [N, K] additional negatives-only logits appended to denominator
         """
-        temperature = self.temperature.exp().clamp(0.01, 10.0)
-        # similarity matrix
-        image_features = F.normalize(image_features, dim=1)
-        sim_matrix = image_features @ image_features.t() / temperature  # [B, B]
+        N = logits.size(0)
+        self_mask = torch.eye(N, device=logits.device, dtype=torch.bool)
 
-        # masks
-        pid_labels = pid_labels.to(sim_matrix.device)
-        pos_mask = pid_labels.unsqueeze(0) == pid_labels.unsqueeze(1)
-        eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device)
-        pos_mask = pos_mask ^ eye.bool()  # remove diagonal
+        # Denominator excludes self
+        logits_den = logits.masked_fill(self_mask, torch.finfo(logits.dtype).min)
+        if extra_den_logits is not None:
+            log_den = torch.logsumexp(torch.cat([logits_den, extra_den_logits], dim=1), dim=1)
+        else:
+            log_den = torch.logsumexp(logits_den, dim=1)
 
-        # log-sum-exp over positives
-        pos_sim = sim_matrix.masked_fill(~pos_mask, -1e4)
-        log_num = torch.logsumexp(pos_sim, dim=1)
+        # Numerator over positives only
+        log_num = torch.logsumexp(logits.masked_fill(~pos_mask, torch.finfo(logits.dtype).min), dim=1)
 
-        # log-sum-exp over all except self (denominator)
-        sim_matrix_no_diag = sim_matrix.masked_fill(eye.bool(), -1e4)
-        log_den = torch.logsumexp(sim_matrix_no_diag, dim=1)
+        valid = pos_mask.sum(dim=1) > 0
+        return -(log_num[valid] - log_den[valid]).mean()
 
-        # MaxSim loss
-        loss = -(log_num - log_den).mean()
-        return loss
+    def loss_mm_supcon(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        pid_labels: torch.Tensor,
+        near_miss_features: torch.Tensor | None = None,  # [B, D]
+    ) -> torch.Tensor:
+        T = self._T()
+
+        img = F.normalize(image_features, dim=1)
+        txt = F.normalize(text_features, dim=1)
+
+        unique_pids, class_txt, inv = self._mean_by_class(txt, pid_labels)
+        class_txt = F.normalize(class_txt, dim=1)
+
+        # anchors: images + class proxies
+        Z = torch.cat([img, class_txt], dim=0)  # [N, D]
+        labels = torch.cat([pid_labels, unique_pids], dim=0)  # [N]
+        N = Z.size(0)
+
+        logits = (Z @ Z.t()) / T
+        logits = logits - logits.max(dim=1, keepdim=True).values  # stability
+
+        self_mask = torch.eye(N, device=Z.device, dtype=torch.bool)
+        pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & (~self_mask)
+
+        # Optional: add per-class near-miss negative in denominator for each anchor
+        extra_den = None
+        if near_miss_features is not None:
+            nm = F.normalize(near_miss_features, dim=1)
+
+            # Collapse duplicated [B, D] near-miss into per-class [P, D]
+            _, class_nm, _ = self._mean_by_class(nm, pid_labels)  # aligns with unique_pids via same pid_labels
+            class_nm = F.normalize(class_nm, dim=1)
+            P = class_nm.size(0)
+
+            # For each anchor, pick its class index in 0..P-1
+            anchor_class_idx = torch.cat(
+                [inv, torch.arange(P, device=Z.device, dtype=inv.dtype)],
+                dim=0
+            )  # [N]
+
+            nm_for_anchor = class_nm[anchor_class_idx]  # [N, D]
+            extra_den = (Z * nm_for_anchor).sum(dim=1, keepdim=True) / T  # [N, 1]
+            extra_den = extra_den - extra_den.max(dim=1, keepdim=True).values
+
+        return self._supcon_loss(logits, pos_mask, extra_den_logits=extra_den)
+
+    def loss_proxy_ce(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        pid_labels: torch.Tensor,
+        near_miss_features: torch.Tensor | None = None,  # [B, D]
+    ) -> torch.Tensor:
+        T = self._T()
+
+        img = F.normalize(image_features, dim=1)
+        txt = F.normalize(text_features, dim=1)
+
+        unique_pids, class_txt, inv = self._mean_by_class(txt, pid_labels)
+        class_txt = F.normalize(class_txt, dim=1)
+
+        logits_proxy = (img @ class_txt.t()) / T  # [B, P]
+
+        if near_miss_features is None:
+            return F.cross_entropy(logits_proxy, inv)
+
+        nm = F.normalize(near_miss_features, dim=1)
+
+        # Collapse duplicated [B, D] near-miss into per-class [P, D]
+        _, class_nm, _ = self._mean_by_class(nm, pid_labels)
+        class_nm = F.normalize(class_nm, dim=1)
+
+        # Each image gets its class's near-miss as one extra negative logit
+        nm_for_img = class_nm[inv]  # [B, D]
+        logits_nm = (img * nm_for_img).sum(dim=1, keepdim=True) / T  # [B, 1]
+
+        logits = torch.cat([logits_proxy, logits_nm], dim=1)  # [B, P+1]
+        return F.cross_entropy(logits, inv)
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        pid_labels: torch.Tensor,
+        near_miss_features: torch.Tensor | None = None,  # [B, D]
+        return_separate: bool = True,
+    ):
+        l_mm = self.loss_mm_supcon(image_features, text_features, pid_labels, near_miss_features)
+        l_ce = self.loss_proxy_ce(image_features, text_features, pid_labels, near_miss_features)
+        l_total = l_mm + self.alpha_proxy_ce * l_ce
+
+        if return_separate:
+            return l_mm, l_ce, l_total
+        return l_total
 
 def mine_hard_triplets(features, labels, base_margin=0.3):
     """
@@ -207,45 +265,31 @@ def lora_orthogonality_loss(lora_As):
 
 
 class TokenMaxSimLoss(nn.Module):
-    def __init__(self, tau=0.07):
+    def __init__(self, tau=0.07, k=4, label_smoothing=0.0):
         super().__init__()
         self.temperature = nn.Parameter(torch.log(torch.tensor(tau)))
+        self.k = k
+        self.label_smoothing = label_smoothing
 
     def forward(self, image_tokens, text_features, pid_labels):
         """
         image_tokens: [B, N, D]
-        text_features: [B, D]
+        text_features: [C, D]
         pid_labels: [B]
         """
-        B, N, D = image_tokens.shape
-        NEG_INF = -1e4
 
         # Normalize
         image_tokens = F.normalize(image_tokens, dim=-1)
         text_features = F.normalize(text_features, dim=-1)
 
-        # Token-level similarity: [B, N, B]
-        sim = torch.einsum("bnd,cd->bnc", image_tokens, text_features)
+        # Token-level similarity: [B, N, C]
+        sim = torch.einsum("bnd,cd->bnc", image_tokens, text_features) / self.temperature.exp().clamp(0.01, 10)
 
-        # Max over image tokens → [B, B]
-        sim_max = sim.max(dim=1).values
-        sim_max = sim_max / self.temperature.exp().clamp(0.01, 10)
+        # Max over image tokens → [B, C]
+        logits = sim.topk(k=self.k, dim=1, largest=True, sorted=False).values.mean(dim=1)
 
         # Masks
-        pid_labels = pid_labels.to(sim_max.device)
-        pos_mask = pid_labels.unsqueeze(0) == pid_labels.unsqueeze(1)
-        eye = torch.eye(B, device=sim_max.device)
-
-        # Numerator: positives (keep diagonal)
-        pos_sim = sim_max.masked_fill(~pos_mask, NEG_INF)
-        log_num = torch.logsumexp(pos_sim, dim=1)
-
-        # Denominator: all except self
-        neg_sim = sim_max.masked_fill(eye.bool(), NEG_INF)
-        log_den = torch.logsumexp(neg_sim, dim=1)
-
-        # Final loss
-        loss = -(log_num - log_den).mean()
+        loss = F.cross_entropy(logits, pid_labels, label_smoothing=self.label_smoothing)
         return loss
 
 def compute_centroids(features: torch.Tensor,

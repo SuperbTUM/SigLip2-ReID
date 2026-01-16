@@ -1,6 +1,6 @@
 MODEL_NAME = "google/siglip2-base-patch16-naflex"
 N_EPOCHS_PRESTAGE = 10
-N_EPOCHS_LoRA = 35
+N_EPOCHS_LoRA = 60
 N_EPOCHS_VISION = 60
 N_WORKER = 2
 N_INSTANCE = 4
