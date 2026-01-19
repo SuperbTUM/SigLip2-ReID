@@ -23,32 +23,22 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def vision_tuning(
         base_model,
         prompt_learners,
-        temperature,
+        classifiers,
         dataset_names,
         input_sizes,
         device
 ):
+    if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth"):
+        classifiers = load_checkpoint(None, None, classifiers, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)[2]
     if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth"):
-        base_model, prompt_learners, temperature, _, _ = load_checkpoint(base_model, prompt_learners, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
+        base_model, prompt_learners, _, _, _, _ = load_checkpoint(base_model, prompt_learners, None, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
-    classifiers = []
     classifier_params = [] # <-- Store classifier params here first
-    embedding_dim = base_model.config.vision_config.hidden_size
 
-    for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True)
+    for dataset_name, input_size, classifier in zip(dataset_names, input_sizes, classifiers):
+        train_dataloader, _, _, _ = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
-
-        # Create classifier and move to device
-        # Classifier: BatchNorm + FC
-        classifier = nn.Sequential(
-            nn.BatchNorm1d(embedding_dim),
-            nn.Linear(embedding_dim, n_cls, bias=False),
-        ).to(device)
-        classifier[0].bias.requires_grad_(False)
-        nn.init.normal_(classifier[1].weight, std=0.01)
-        classifiers.append(classifier)
         
         # Add its parameters to the list
         classifier_params.extend(list(classifier.parameters()))
@@ -70,7 +60,7 @@ def vision_tuning(
         del base_model.vision_model.peft_config
     vision_model = base_model.vision_model
     params = []
-    base_lr = 5e-4
+    base_lr = 2e-4
     for name, param in vision_model.named_parameters():
         param.requires_grad = True
         if "bias" in name:
@@ -144,19 +134,15 @@ def vision_tuning(
             image_features_domain = image_features_domain.float()
             last_hidden_state = last_hidden_state.float()
             
-            image_features_centroid = compute_centroids(image_features, label, True)
-            image_features_domain_centroid = compute_centroids(image_features_domain, label, True)
-            image_align_loss = (1 - (image_features_centroid.detach() * image_features_domain_centroid).sum(dim=1)).mean()
-            domain_contrast_loss = info_nce_loss(image_features_domain, image_features.detach(), label, label)
             # Cross-entropy loss
-            logits = classifiers[i](image_features_domain)
-            loss_ce = criterion[i](logits, label) + criterion[i](image_features_domain @ modified_text_embeddings[i].t(), label)
+            logits = classifiers[i](image_features)
+            loss_ce = 0.25 * criterion[i](logits, label) + criterion[i](image_features @ modified_text_embeddings[i].t(), label)
 
-            loss_triplet = mine_hard_triplets(image_features_domain, label)
+            loss_triplet = mine_hard_triplets(image_features, label)
 
             # MaxSim loss
             loss_maxsim = token_max_sim_loss(last_hidden_state, modified_text_embeddings[i], label)
-            total_loss += loss_ce + loss_maxsim + 0.1 * image_align_loss + 0.1 * domain_contrast_loss + loss_triplet
+            total_loss += loss_ce + loss_triplet
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps
@@ -165,8 +151,8 @@ def vision_tuning(
 
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
-                if epoch <= 10:
-                    scaler.step(temperature_optimizer)
+                # if epoch <= 10:
+                #     scaler.step(temperature_optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 temperature_optimizer.zero_grad()
@@ -179,7 +165,7 @@ def vision_tuning(
 
     # vision_model = vision_model.merge_and_unload()
     base_model.vision_model = vision_model
-    save_checkpoint(base_model, prompt_learners, None, N_EPOCHS_VISION, optimizer, scheduler)
+    save_checkpoint(base_model, prompt_learners, None, N_EPOCHS_VISION, None, optimizer, scheduler)
     return base_model.eval()
 
 def test(model,
@@ -211,18 +197,18 @@ if __name__ == "__main__":
     class_names_list = ["person", "vehicle"]
     
     # Get the pre-tuned base model and prompt learners from locked image tuning
-    base_model = tuning_vision_projection(dataset_names, input_sizes, DEVICE)
+    base_model, classifiers = tuning_vision_projection(dataset_names, input_sizes, DEVICE)
     for i, dataset_name in enumerate(dataset_names):
         cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE, False)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()    
-    base_model, prompt_learners, temperature = LoRA_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
+    base_model, prompt_learners = LoRA_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
 
     # Run LoRA vision tuning
-    model = vision_tuning(base_model, prompt_learners, temperature, dataset_names, input_sizes, DEVICE)
+    model = vision_tuning(base_model, prompt_learners, classifiers, dataset_names, input_sizes, DEVICE)
     
     for i, dataset_name in enumerate(dataset_names):
-        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE, True)
+        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE, False)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()
 

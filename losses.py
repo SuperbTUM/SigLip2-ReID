@@ -6,9 +6,12 @@ class SupConLoss(nn.Module):
     def __init__(self, device):
         super(SupConLoss, self).__init__()
         self.device = device
-        self.temperature = nn.Parameter(torch.log(torch.tensor(1.0, device=device)))
+        self.temperature = nn.Parameter(torch.log(torch.tensor(0.07, device=device)))
 
     def forward(self, text_features, image_features, t_label, i_targets, same_modality=False):
+        text_features = F.normalize(text_features)
+        image_features = F.normalize(image_features)
+        
         temperature = self.temperature.exp().clamp(0.01, 10.0)
 
         batch_size = text_features.shape[0]
@@ -41,166 +44,148 @@ class MMSupConAndProxyCE(nn.Module):
     """
     Two losses:
       (1) L_mm_supcon: supervised contrastive over anchors Z = [images ; class_text_proxies]
-          positives = same class (image-image, image-proxy, proxy-image)
-          + optional per-class near-miss negative in denominator
+          anchors = class text proxies (P)
+          contrasts = images (B)
+          positives per proxy = K images of that class
 
-      (2) L_proxy_ce: image -> class proxy CE
-          + optional per-class near-miss negative as an extra logit
+      (2) L_proxy_ce: image -> class proxy CE (batch-proxy CE over P classes)
 
-    Inputs:
-      image_features: [B, D]
-      text_features:  [B, D]  (soft prompt embedding per image; duplicated per class with PK)
-      pid_labels:     [B]
-      near_miss_features: optional [B, D] (near-miss prompt embedding per image; duplicated per class)
+      Add near-miss as a negative with a *pairwise margin/ranking* term:
+          L_rank = mean ReLU(margin + sim(img, nm_y) - sim(img, soft_y))
+
+      This is a clean signal when near_miss is a GPT distractor for the same class:
+          enforce: sim(img, soft_prompt_y) > sim(img, near_miss_y) + margin
     """
 
-    def __init__(self, temperature: float = 0.07, alpha_proxy_ce: float = 0.1):
+    def __init__(
+        self,
+        temperature: float = 0.07,
+        alpha_ce: float = 0.1,
+        alpha_rank: float = 0.1,
+        rank_margin: float = 0.1,
+        min_logT: float = -4.605170186,  # log(0.01)
+        max_logT: float = 0.0,           # log(1.0)
+    ):
         super().__init__()
         self.log_temperature = nn.Parameter(torch.log(torch.tensor(float(temperature))))
-        self.alpha_proxy_ce = alpha_proxy_ce
+        self.alpha_ce = float(alpha_ce)
+        self.alpha_rank = float(alpha_rank)
+        self.rank_margin = float(rank_margin)
+        self.min_logT = float(min_logT)
+        self.max_logT = float(max_logT)
 
     def _T(self) -> torch.Tensor:
-        return self.log_temperature.exp().clamp(0.01, 1.0)  # logits = sim / T
+        # Clamp in log-space so gradients don't die at the clamp boundaries
+        logT = self.log_temperature.clamp(self.min_logT, self.max_logT)
+        return logT.exp()  # logits = sim / T
 
     @staticmethod
     def _mean_by_class(features: torch.Tensor, pid_labels: torch.Tensor):
-        """
-        Mean-pool features per class in the batch.
-
-        Returns:
-          unique_pids: [P]
-          class_feats: [P, D]
-          inv:         [B] in 0..P-1
-        """
         unique_pids, inv = torch.unique(pid_labels, return_inverse=True)
         P, D = unique_pids.size(0), features.size(1)
-
-        class_feats = torch.zeros(P, D, device=features.device, dtype=features.dtype)
-        class_feats.index_add_(0, inv, features)
-
+        out = torch.zeros(P, D, device=features.device, dtype=features.dtype)
+        out.index_add_(0, inv, features)
         counts = torch.bincount(inv, minlength=P).to(features.device).clamp_min(1).unsqueeze(1)
-        class_feats = class_feats / counts
-        return unique_pids, class_feats, inv
+        out = out / counts
+        return unique_pids, out, inv  # inv: [B] in 0..P-1
 
     @staticmethod
-    def _supcon_loss(logits: torch.Tensor, pos_mask: torch.Tensor, extra_den_logits: torch.Tensor | None = None):
+    def _supcon_from_logits(logits: torch.Tensor, pos_mask: torch.Tensor, mask_out: torch.Tensor | None = None):
         """
-        logits: [N, N] anchor-to-anchor logits
-        pos_mask: [N, N] True where positive (excluding self)
-        extra_den_logits: [N, K] additional negatives-only logits appended to denominator
+        logits:   [A, N]
+        pos_mask: [A, N] boolean positives
+        mask_out: [A, N] boolean where True means "exclude from denominator" (e.g., self)
         """
-        N = logits.size(0)
-        self_mask = torch.eye(N, device=logits.device, dtype=torch.bool)
+        dtype = logits.dtype
+        NEG = torch.finfo(dtype).min
 
-        # Denominator excludes self
-        logits_den = logits.masked_fill(self_mask, torch.finfo(logits.dtype).min)
-        if extra_den_logits is not None:
-            log_den = torch.logsumexp(torch.cat([logits_den, extra_den_logits], dim=1), dim=1)
+        if mask_out is None:
+            logits_den = logits
         else:
-            log_den = torch.logsumexp(logits_den, dim=1)
+            logits_den = logits.masked_fill(mask_out, NEG)
 
-        # Numerator over positives only
-        log_num = torch.logsumexp(logits.masked_fill(~pos_mask, torch.finfo(logits.dtype).min), dim=1)
+        # stability
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+        logits_den = logits_den - logits_den.max(dim=1, keepdim=True).values.detach()
+
+        log_den = torch.logsumexp(logits_den, dim=1)  # [A]
+        log_num = torch.logsumexp(logits.masked_fill(~pos_mask, NEG), dim=1)  # [A]
 
         valid = pos_mask.sum(dim=1) > 0
         return -(log_num[valid] - log_den[valid]).mean()
 
-    def loss_mm_supcon(
-        self,
-        image_features: torch.Tensor,
-        text_features: torch.Tensor,
-        pid_labels: torch.Tensor,
-        near_miss_features: torch.Tensor | None = None,  # [B, D]
-    ) -> torch.Tensor:
-        T = self._T()
+    def loss_mm_proxy_to_image(self, image_features, text_features, pid_labels):
+        """
+        Cross-modal supervised contrastive:
+          anchors = class text proxies (P)
+          contrasts = images (B)
+          positives per proxy = K images of that class
+        """
+        T = self._T().float()
+        img = F.normalize(image_features.float(), dim=1, eps=1e-6)   # [B,D]
+        txt = F.normalize(text_features.float(), dim=1, eps=1e-6)    # [B,D]
 
-        img = F.normalize(image_features, dim=1)
-        txt = F.normalize(text_features, dim=1)
+        unique_pids, class_txt, _ = self._mean_by_class(txt, pid_labels)  # [P,D]
+        class_txt = F.normalize(class_txt, dim=1, eps=1e-6)
 
-        unique_pids, class_txt, inv = self._mean_by_class(txt, pid_labels)
-        class_txt = F.normalize(class_txt, dim=1)
+        logits = (class_txt @ img.t()) / T  # [P, B]
+        pos_mask = (unique_pids.view(-1, 1) == pid_labels.view(1, -1))  # [P,B]
+        return self._supcon_from_logits(logits, pos_mask)
 
-        # anchors: images + class proxies
-        Z = torch.cat([img, class_txt], dim=0)  # [N, D]
-        labels = torch.cat([pid_labels, unique_pids], dim=0)  # [N]
-        N = Z.size(0)
+    def loss_ce_image_to_proxy(self, image_features, text_features, pid_labels):
+        """
+        Batch-proxy CE: image -> class proxy among P batch classes.
+        """
+        T = self._T().float()
+        img = F.normalize(image_features.float(), dim=1, eps=1e-6)
+        txt = F.normalize(text_features.float(), dim=1, eps=1e-6)
 
-        logits = (Z @ Z.t()) / T
-        logits = logits - logits.max(dim=1, keepdim=True).values  # stability
+        _, class_txt, inv = self._mean_by_class(txt, pid_labels)   # [P,D], inv:[B]
+        class_txt = F.normalize(class_txt, dim=1, eps=1e-6)
 
-        self_mask = torch.eye(N, device=Z.device, dtype=torch.bool)
-        pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & (~self_mask)
+        logits_proxy = (img @ class_txt.t()) / T  # [B,P]
+        return F.cross_entropy(logits_proxy, inv)
 
-        # Optional: add per-class near-miss negative in denominator for each anchor
-        extra_den = None
-        if near_miss_features is not None:
-            nm = F.normalize(near_miss_features, dim=1)
+    def loss_rank_soft_vs_nearmiss(self, image_features, text_features, pid_labels, near_miss_features):
+        """
+        Pairwise margin/ranking loss enforcing:
+            sim(img, soft_proxy_y) >= sim(img, near_miss_y) + margin
 
-            # Collapse duplicated [B, D] near-miss into per-class [P, D]
-            _, class_nm, _ = self._mean_by_class(nm, pid_labels)  # aligns with unique_pids via same pid_labels
-            class_nm = F.normalize(class_nm, dim=1)
-            P = class_nm.size(0)
+        near_miss_features: [B,D] duplicated per class with PK; collapsed to [P,D].
+        """
+        T = self._T().float()
+        img = F.normalize(image_features.float(), dim=1, eps=1e-6)
+        txt = F.normalize(text_features.float(), dim=1, eps=1e-6)
+        nm = F.normalize(near_miss_features.float(), dim=1, eps=1e-6)
 
-            # For each anchor, pick its class index in 0..P-1
-            anchor_class_idx = torch.cat(
-                [inv, torch.arange(P, device=Z.device, dtype=inv.dtype)],
-                dim=0
-            )  # [N]
+        _, class_txt, inv = self._mean_by_class(txt, pid_labels)   # [P,D], inv:[B]
+        class_txt = F.normalize(class_txt, dim=1, eps=1e-6)
 
-            nm_for_anchor = class_nm[anchor_class_idx]  # [N, D]
-            extra_den = (Z * nm_for_anchor).sum(dim=1, keepdim=True) / T  # [N, 1]
-            extra_den = extra_den - extra_den.max(dim=1, keepdim=True).values
+        _, class_nm, _ = self._mean_by_class(nm, pid_labels)       # [P,D]
+        class_nm = F.normalize(class_nm, dim=1, eps=1e-6)
 
-        return self._supcon_loss(logits, pos_mask, extra_den_logits=extra_den)
+        # per-sample sims to its class proxies
+        s_soft = (img * class_txt[inv]).sum(dim=1) / T  # [B]
+        s_nm = (img * class_nm[inv]).sum(dim=1) / T     # [B]
 
-    def loss_proxy_ce(
-        self,
-        image_features: torch.Tensor,
-        text_features: torch.Tensor,
-        pid_labels: torch.Tensor,
-        near_miss_features: torch.Tensor | None = None,  # [B, D]
-    ) -> torch.Tensor:
-        T = self._T()
+        # hinge ranking
+        return F.relu(self.rank_margin + s_nm - s_soft).mean()
 
-        img = F.normalize(image_features, dim=1)
-        txt = F.normalize(text_features, dim=1)
+    def forward(self, image_features, text_features, pid_labels, near_miss_features=None, return_separate=True):
+        l_mm = self.loss_mm_proxy_to_image(image_features, text_features, pid_labels)
+        l_ce = self.loss_ce_image_to_proxy(image_features, text_features, pid_labels)
 
-        unique_pids, class_txt, inv = self._mean_by_class(txt, pid_labels)
-        class_txt = F.normalize(class_txt, dim=1)
-
-        logits_proxy = (img @ class_txt.t()) / T  # [B, P]
-
-        if near_miss_features is None:
-            return F.cross_entropy(logits_proxy, inv)
-
-        nm = F.normalize(near_miss_features, dim=1)
-
-        # Collapse duplicated [B, D] near-miss into per-class [P, D]
-        _, class_nm, _ = self._mean_by_class(nm, pid_labels)
-        class_nm = F.normalize(class_nm, dim=1)
-
-        # Each image gets its class's near-miss as one extra negative logit
-        nm_for_img = class_nm[inv]  # [B, D]
-        logits_nm = (img * nm_for_img).sum(dim=1, keepdim=True) / T  # [B, 1]
-
-        logits = torch.cat([logits_proxy, logits_nm], dim=1)  # [B, P+1]
-        return F.cross_entropy(logits, inv)
-
-    def forward(
-        self,
-        image_features: torch.Tensor,
-        text_features: torch.Tensor,
-        pid_labels: torch.Tensor,
-        near_miss_features: torch.Tensor | None = None,  # [B, D]
-        return_separate: bool = True,
-    ):
-        l_mm = self.loss_mm_supcon(image_features, text_features, pid_labels, near_miss_features)
-        l_ce = self.loss_proxy_ce(image_features, text_features, pid_labels, near_miss_features)
-        l_total = l_mm + self.alpha_proxy_ce * l_ce
+        l_rank = None
+        if near_miss_features is not None and self.alpha_rank > 0:
+            l_rank = self.loss_rank_soft_vs_nearmiss(image_features, text_features, pid_labels, near_miss_features)
+            total = l_mm + self.alpha_ce * l_ce + self.alpha_rank * l_rank
+        else:
+            total = l_mm + self.alpha_ce * l_ce
 
         if return_separate:
-            return l_mm, l_ce, l_total
-        return l_total
+            # return l_rank=0 when absent for easy logging
+            return l_mm, l_ce, (l_rank if l_rank is not None else image_features.new_tensor(0.0)), total
+        return total
 
 def mine_hard_triplets(features, labels, base_margin=0.3):
     """
@@ -265,32 +250,46 @@ def lora_orthogonality_loss(lora_As):
 
 
 class TokenMaxSimLoss(nn.Module):
-    def __init__(self, tau=0.07, k=4, label_smoothing=0.0):
+    def __init__(self, tau=0.07, p=1.0, label_smoothing=0.0,
+                 min_log_tau=-6.0, max_log_tau=2.0):
         super().__init__()
-        self.temperature = nn.Parameter(torch.log(torch.tensor(tau)))
-        self.k = k
+        self.log_tau = nn.Parameter(torch.log(torch.tensor(float(tau))))
+        self.p = nn.Parameter(torch.tensor(p))  # learnable sharpness
         self.label_smoothing = label_smoothing
+        self.min_log_tau = min_log_tau
+        self.max_log_tau = max_log_tau
+        self.eps = 1e-6
+
+    def gem_pool_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        tokens: [B, N, D] -> pooled: [B, D]
+        """
+        p = self.p.clamp(1.0, 4.0)
+
+        # Signed GeM over tokens: sign(mean) * GeM(|x|)
+        mag = tokens.abs().clamp_min(self.eps)
+        pooled_mag = mag.pow(p).mean(dim=1).clamp_min(self.eps).pow(1.0 / p)
+        pooled_sign = tokens.mean(dim=1).sign()
+        return pooled_sign * pooled_mag
 
     def forward(self, image_tokens, text_features, pid_labels):
-        """
-        image_tokens: [B, N, D]
-        text_features: [C, D]
-        pid_labels: [B]
-        """
+        # Normalize tokens + text prototypes
+        image_tokens = F.normalize(image_tokens, dim=-1)   # [B,N,D]
+        text_features = F.normalize(text_features, dim=-1) # [C,D]
 
-        # Normalize
-        image_tokens = F.normalize(image_tokens, dim=-1)
-        text_features = F.normalize(text_features, dim=-1)
+        # 1) GeM pool tokens -> [B,D]
+        img_emb = self.gem_pool_tokens(image_tokens)
+        img_emb = F.normalize(img_emb, dim=-1)
 
-        # Token-level similarity: [B, N, C]
-        sim = torch.einsum("bnd,cd->bnc", image_tokens, text_features) / self.temperature.exp().clamp(0.01, 10)
+        # 2) CLIP-style logits over classes
+        tau = self.log_tau.clamp(self.min_log_tau, self.max_log_tau).exp()
+        logits = (img_emb @ text_features.t()) / tau       # [B,C]
 
-        # Max over image tokens → [B, C]
-        logits = sim.topk(k=self.k, dim=1, largest=True, sorted=False).values.mean(dim=1)
+        # 3) CE loss
+        return F.cross_entropy(
+            logits, pid_labels.long(), label_smoothing=self.label_smoothing
+        )
 
-        # Masks
-        loss = F.cross_entropy(logits, pid_labels, label_smoothing=self.label_smoothing)
-        return loss
 
 def compute_centroids(features: torch.Tensor,
                       labels: torch.Tensor,
