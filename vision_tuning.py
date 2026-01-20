@@ -2,7 +2,7 @@ import model
 from constants import *
 from data_preparation import *
 from checkpoint import *
-from losses import SupConLoss, TokenMaxSimLoss, compute_centroids, mine_hard_triplets
+from losses import TokenMaxSimLoss, mine_hard_triplets, MMSupConAndProxyCE
 from evaluation import R1_mAP_eval_pt
 from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
 
@@ -60,7 +60,7 @@ def vision_tuning(
         del base_model.vision_model.peft_config
     vision_model = base_model.vision_model
     params = []
-    base_lr = 2e-4
+    base_lr = 5e-5
     for name, param in vision_model.named_parameters():
         param.requires_grad = True
         if "bias" in name:
@@ -73,13 +73,13 @@ def vision_tuning(
     # --- 4. NOW Create the Optimizer ---
     # vision_model.parameters() will *only* return the trainable LoRA parameters
     scaler = GradScaler(device)
-    info_nce_loss = SupConLoss(device)
+    sup_con_loss = MMSupConAndProxyCE(alpha_ce=1.0, alpha_rank=0.)
     token_max_sim_loss = TokenMaxSimLoss().to(device)
     criterion = [nn.CrossEntropyLoss(label_smoothing=0.05).to(device), nn.CrossEntropyLoss(label_smoothing=0.1).to(device)]
     params += [
         {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
     ]
-    temperature_params = [{'params': list(token_max_sim_loss.parameters()) + list(info_nce_loss.parameters()), 'lr': base_lr}]
+    temperature_params = [{'params': list(token_max_sim_loss.parameters()) + list(sup_con_loss.parameters()), 'lr': base_lr}]
     optimizer = torch.optim.Adam(params, lr=base_lr, weight_decay=1e-4)
     temperature_optimizer = torch.optim.Adam(temperature_params, lr=base_lr)
 
@@ -101,7 +101,8 @@ def vision_tuning(
             param.requires_grad = False
         prompt_learner.eval()
         with torch.no_grad():
-            modified_text_embedding = prompt_learner(text_model, i % 1)
+            n_cls = prompt_learner.n_cls
+            modified_text_embedding = prompt_learner(text_model, i % 1, torch.arange(n_cls, device=device))
             modified_text_embeddings.append(modified_text_embedding)
 
     # --- Training Loop (with Gradient Accumulation) ---
@@ -110,11 +111,11 @@ def vision_tuning(
     for epoch in range(N_EPOCHS_VISION):
         loss_by_epoch = 0
         optimizer.zero_grad()
-        if epoch <= 10:
-            temperature_optimizer.zero_grad()
-        else:
-            for param in token_max_sim_loss.parameters():
-                param.requires_grad = False
+        # if epoch <= 10:
+        temperature_optimizer.zero_grad()
+        # else:
+        #     for param in token_max_sim_loss.parameters():
+        #         param.requires_grad = False
 
         dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
         round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
@@ -139,10 +140,11 @@ def vision_tuning(
             loss_ce = 0.25 * criterion[i](logits, label) + criterion[i](image_features @ modified_text_embeddings[i].t(), label)
 
             loss_triplet = mine_hard_triplets(image_features, label)
+            loss_sup_con = sup_con_loss(image_features, modified_text_embeddings[i][label], label, None, False)
 
             # MaxSim loss
             loss_maxsim = token_max_sim_loss(last_hidden_state, modified_text_embeddings[i], label)
-            total_loss += loss_ce + loss_triplet
+            total_loss += loss_ce + loss_triplet + loss_sup_con + 0.1 * loss_maxsim
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps
@@ -152,7 +154,7 @@ def vision_tuning(
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
                 # if epoch <= 10:
-                #     scaler.step(temperature_optimizer)
+                scaler.step(temperature_optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 temperature_optimizer.zero_grad()

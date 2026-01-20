@@ -17,7 +17,7 @@ def load_weights(model_name, text_model_loaded=True):
         reproduced_model.vision_model.load_state_dict(model_dict, False)
         reproduced_model.text_model.load_state_dict(model_dict, False)
     else:
-        reproduced_model.vision_model.load_state_dict(vision_model_dict)
+        reproduced_model.vision_model.vision_model.load_state_dict(vision_model_dict)
     reproduced_model.eval()
     return reproduced_model
 

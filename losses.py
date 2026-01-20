@@ -250,46 +250,44 @@ def lora_orthogonality_loss(lora_As):
 
 
 class TokenMaxSimLoss(nn.Module):
-    def __init__(self, tau=0.07, p=1.0, label_smoothing=0.0,
-                 min_log_tau=-6.0, max_log_tau=2.0):
+    def __init__(self, tau=0.07, attn_tau=0.07, label_smoothing=0.0):
         super().__init__()
         self.log_tau = nn.Parameter(torch.log(torch.tensor(float(tau))))
-        self.p = nn.Parameter(torch.tensor(p))  # learnable sharpness
+        self.log_attn_tau = nn.Parameter(torch.log(torch.tensor(float(attn_tau))))
         self.label_smoothing = label_smoothing
-        self.min_log_tau = min_log_tau
-        self.max_log_tau = max_log_tau
-        self.eps = 1e-6
 
-    def gem_pool_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        tokens: [B, N, D] -> pooled: [B, D]
-        """
-        p = self.p.clamp(1.0, 4.0)
+    def forward(self, image_tokens, text_features, pid_labels, return_attn=False):
+        # normalize
+        toks = F.normalize(image_tokens.float(), dim=-1)      # [B,N,D]
+        txt  = F.normalize(text_features.float(), dim=-1)     # [C,D]
 
-        # Signed GeM over tokens: sign(mean) * GeM(|x|)
-        mag = tokens.abs().clamp_min(self.eps)
-        pooled_mag = mag.pow(p).mean(dim=1).clamp_min(self.eps).pow(1.0 / p)
-        pooled_sign = tokens.mean(dim=1).sign()
-        return pooled_sign * pooled_mag
+        B, N, D = toks.shape
+        C = txt.shape[0]
 
-    def forward(self, image_tokens, text_features, pid_labels):
-        # Normalize tokens + text prototypes
-        image_tokens = F.normalize(image_tokens, dim=-1)   # [B,N,D]
-        text_features = F.normalize(text_features, dim=-1) # [C,D]
+        # token-to-class sims: [B,N,C]
+        sims = torch.einsum("bnd,cd->bnc", toks, txt)
 
-        # 1) GeM pool tokens -> [B,D]
-        img_emb = self.gem_pool_tokens(image_tokens)
-        img_emb = F.normalize(img_emb, dim=-1)
+        # attention map for the GT class: [B,N]
+        gt = pid_labels.long()
+        sims_gt = sims[torch.arange(B, device=toks.device), :, gt]  # [B,N]
 
-        # 2) CLIP-style logits over classes
-        tau = self.log_tau.clamp(self.min_log_tau, self.max_log_tau).exp()
-        logits = (img_emb @ text_features.t()) / tau       # [B,C]
+        # convert sims_gt -> token weights via softmax (differentiable "argmax")
+        attn_tau = self.log_attn_tau.exp().clamp(0.01, 1.0)
+        w = F.softmax(sims_gt / attn_tau, dim=1)  # [B,N], sums to 1
 
-        # 3) CE loss
-        return F.cross_entropy(
-            logits, pid_labels.long(), label_smoothing=self.label_smoothing
-        )
+        # class logits: aggregate token sims with weights
+        # logits[b,c] = sum_n w[b,n] * sims[b,n,c]
+        logits = torch.einsum("bn,bnc->bc", w, sims)  # [B,C]
 
+        tau = self.log_tau.exp().clamp(0.01, 1.0)
+        logits = logits / tau
+
+        loss = F.cross_entropy(logits, gt, label_smoothing=self.label_smoothing)
+
+        if return_attn:
+            # Return token attention weights and/or sims_gt as map
+            return loss, w, sims_gt
+        return loss
 
 def compute_centroids(features: torch.Tensor,
                       labels: torch.Tensor,
