@@ -55,9 +55,9 @@ def vision_tuning(
 
     base_model.vision_model = base_model.vision_model.train()
     
-    # This creates the *new* trainable LoRA parameters
-    if hasattr(base_model.vision_model, "peft_config"):
-        del base_model.vision_model.peft_config
+    # # This creates the *new* trainable LoRA parameters
+    # if hasattr(base_model.vision_model, "peft_config"):
+    #     del base_model.vision_model.peft_config
     vision_model = base_model.vision_model
     params = []
     base_lr = 5e-5
@@ -75,7 +75,7 @@ def vision_tuning(
     scaler = GradScaler(device)
     sup_con_loss = MMSupConAndProxyCE(alpha_ce=1.0, alpha_rank=0.)
     token_max_sim_loss = TokenMaxSimLoss().to(device)
-    criterion = [nn.CrossEntropyLoss(label_smoothing=0.05).to(device), nn.CrossEntropyLoss(label_smoothing=0.1).to(device)]
+    criterion = [nn.CrossEntropyLoss(label_smoothing=0.1), nn.CrossEntropyLoss(label_smoothing=0.1)]
     params += [
         {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
     ]
@@ -137,14 +137,14 @@ def vision_tuning(
             
             # Cross-entropy loss
             logits = classifiers[i](image_features)
-            loss_ce = 0.25 * criterion[i](logits, label) + criterion[i](image_features @ modified_text_embeddings[i].t(), label)
+            loss_ce = 0.25 * criterion[i](logits, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embeddings[i]).t() / 0.07, label)
 
             loss_triplet = mine_hard_triplets(image_features, label)
-            loss_sup_con = sup_con_loss(image_features, modified_text_embeddings[i][label], label, None, False)
+            # loss_sup_con = sup_con_loss(image_features, modified_text_embeddings[i][label], label, None, False)
 
             # MaxSim loss
             loss_maxsim = token_max_sim_loss(last_hidden_state, modified_text_embeddings[i], label)
-            total_loss += loss_ce + loss_triplet + loss_sup_con + 0.1 * loss_maxsim
+            total_loss += loss_ce + loss_triplet + 0.5 * loss_maxsim
 
             # Normalize loss for accumulation
             total_loss = total_loss / accumulation_steps

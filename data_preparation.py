@@ -128,15 +128,39 @@ class RandomIdentitySampler(Sampler):
         return self.length
 
 def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=False, dual_branch=False):
-    unaugment_preprocessing = T.Compose([
+    weak_augment_preprocessing = T.Compose([
             T.Resize(input_size),
+            T.RandomHorizontalFlip(0.5),
+            T.Pad(10),
+            T.RandomCrop(input_size),
             T.ToTensor(),
             T.Normalize(mean=0.5, std=0.5)
+        ])
+    strong_augment_preprocessing = T.Compose([
+            T.Resize(input_size),
+            T.RandomHorizontalFlip(0.5),
+            T.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.3,
+                hue=0.1,
+            ),
+            T.Pad(10),
+            T.RandomCrop(input_size),
+            T.ToTensor(),
+            T.Normalize(mean=0.5, std=0.5),
+            T.RandomErasing(p=1.0),
         ])
     if augmented:
         preprocessing = T.Compose([
             T.Resize(input_size),
             T.RandomHorizontalFlip(0.5),
+            T.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.3,
+                hue=0.1,
+            ),
             T.Pad(10),
             T.RandomCrop(input_size),
             T.ToTensor(),
@@ -155,7 +179,7 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
         dataset = VeRi(verbose=False)
     if type == "train":
         if dual_branch:
-            preprocessed_dataset = ImageDataset(dataset.train, preprocessing, unaugment_preprocessing)
+            preprocessed_dataset = ImageDataset(dataset.train, strong_augment_preprocessing, weak_augment_preprocessing)
         else:
             preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
         if use_ai_prompts:

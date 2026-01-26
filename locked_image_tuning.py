@@ -3,7 +3,7 @@ from constants import *
 from data_preparation import *
 from checkpoint import *
 # from teacher import teacher_model_output
-from losses import MMSupConAndProxyCE, lora_orthogonality_loss, collect_trainable_lora_As, SupConLoss, mine_hard_triplets
+from losses import MMSupConAndProxyCE, collect_trainable_lora_As, SupConLoss, mine_hard_triplets
 
 import transformers
 import torch
@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from peft import get_peft_model, LoraConfig
-from typing import List, Optional
+from typing import List
 import itertools
 
 import os
@@ -97,28 +97,30 @@ def tuning_vision_projection(dataset_names,
         token_ai_prompt = text_tokenizer(ai_prompt, padding=True, return_tensors="pt").input_ids.to(device)
         ai_prompts.append(token_ai_prompt)
     base_model.train()
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        use_dora=True,
-        init_lora_weights="pissa_niter_8"
-    )
-    base_model.vision_model = get_peft_model(base_model.vision_model, lora_config)
+    # lora_config = LoraConfig(
+    #     r=16,
+    #     lora_alpha=32,
+    #     target_modules=["q_proj", "v_proj"],
+    #     lora_dropout=0.05,
+    #     bias="none",
+    #     use_dora=True,
+    #     init_lora_weights="pissa_niter_8"
+    # )
+    # base_model.vision_model = get_peft_model(base_model.vision_model, lora_config)
     base_model.text_model.eval()
     for param in base_model.text_model.parameters():
         param.requires_grad = False
     for name, param in base_model.vision_model.named_parameters():
         if "dal" in name.lower():
             param.requires_grad = False
+        else:
+            param.requires_grad = True
     base_model = base_model.to(device)
 
     train_dataloaders = []
     n_clses = []
     for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False)
+        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False, True)
         train_dataloaders.append(train_dataloader)
         n_clses.append(n_cls)
 
@@ -157,9 +159,10 @@ def tuning_vision_projection(dataset_names,
     num_batches = max(len(loader) for loader in train_dataloaders) * len(train_dataloaders)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=4e-3,
+        max_lr=5e-4,
         total_steps=num_batches * N_EPOCHS_PRESTAGE,
-        pct_start=0.2,
+        pct_start=0.1,
+        div_factor=10,
         final_div_factor=10
     )
 
@@ -172,7 +175,8 @@ def tuning_vision_projection(dataset_names,
 
             i, dataloader_iter = next(round_robin_iter)
 
-            image_tensor, label_batch = next(dataloader_iter)[:2]
+            batched_data = next(dataloader_iter)
+            image_tensor, label_batch, image_tensor_2 = batched_data[0], batched_data[1], batched_data[5]
 
             optimizer.zero_grad()
             temperature_optimizer.zero_grad()
@@ -183,15 +187,18 @@ def tuning_vision_projection(dataset_names,
             frozen_text_feature = frozen_text_features_list[i][label_batch]
 
             with autocast(device):
-                image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
-                logits = classifiers[i](image_features_batch)
-            
+                image_features_batch_2 = base_model.get_image_features(image_tensor_2.to(device), domain_ids=domain_batch)[0]
+                logits = classifiers[i](image_features_batch_2)
+                with torch.no_grad():
+                    image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
+                    
             image_features_batch = image_features_batch.float()
+            image_features_batch_2 = image_features_batch_2.float()
             logits = logits.float()
             image_classification_loss = F.cross_entropy(logits, label_batch, label_smoothing=0.1)
-            image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch, label_batch, label_batch, True) + \
-                                        mine_hard_triplets(image_features_batch, label_batch)
-            image_text_loss = info_nce_loss(image_features_batch, frozen_text_feature.detach(), label_batch, None, False)
+            image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch_2, label_batch, label_batch, True) + \
+                                        mine_hard_triplets(image_features_batch_2, label_batch)
+            image_text_loss = info_nce_loss(image_features_batch_2, frozen_text_feature.detach(), label_batch, None, False)
 
             loss = image_contrastive_loss + image_classification_loss + 0.1 * image_text_loss 
             total_loss += loss
@@ -204,7 +211,7 @@ def tuning_vision_projection(dataset_names,
             scheduler.step()
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
-    base_model.vision_model = base_model.vision_model.merge_and_unload()
+    # base_model.vision_model = base_model.vision_model.merge_and_unload()
     save_checkpoint(base_model.eval(), None, real_sup_con_loss.temperature.exp().item(), N_EPOCHS_PRESTAGE, classifiers, optimizer, scheduler)
     return base_model.eval(), classifiers
 
@@ -243,7 +250,6 @@ def LoRA_tuning_variable_dataset(base_model,
     n_clses = []
     text_encoder_params = list(filter(lambda p: p.requires_grad, lora_model.parameters()))
     prompt_learner_params = []
-    lora_params = collect_trainable_lora_As(lora_model)
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
         train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True)
@@ -281,13 +287,14 @@ def LoRA_tuning_variable_dataset(base_model,
         schedulers=[
             torch.optim.lr_scheduler.LinearLR(
                 prompt_learner_optimizer,
-                start_factor=0.1,
+                start_factor=0.1,      
                 end_factor=1.0,
                 total_iters=5
-            ),
-            torch.optim.lr_scheduler.LambdaLR(
-                prompt_learner_optimizer,
-                lr_lambda=lambda _: 1.0
+            ), 
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                prompt_learner_optimizer, 
+                T_max=N_EPOCHS_LoRA-5, 
+                eta_min=1e-6
             )
         ],
         milestones=[5]
@@ -372,8 +379,7 @@ def LoRA_tuning_variable_dataset(base_model,
                 text_features = prompt_learners[i](lora_model.text_model, domain_batch, label_batch)
             
             text_features = text_features.float()
-            loss = sup_con_loss(image_features_batch, text_features, label_batch, frozen_text_features_batch, False) + \
-                    1e-4 * lora_orthogonality_loss(lora_params)
+            loss = sup_con_loss(image_features_batch, text_features, label_batch, frozen_text_features_batch, False)
             total_loss += loss
 
             scaler.scale(total_loss).backward()
@@ -392,6 +398,6 @@ def LoRA_tuning_variable_dataset(base_model,
     base_model.text_model = lora_model.text_model.merge_and_unload()
     for prompt_learner in prompt_learners:
         prompt_learner.eval()
-    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.log_temperature.exp().item(), N_EPOCHS_LoRA, None, text_encoder_optimizer, scheduler)
+    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.log_temperature.exp().item(), N_EPOCHS_LoRA, None, text_encoder_optimizer, prompt_scheduler)
     return base_model.eval(), prompt_learners
 
