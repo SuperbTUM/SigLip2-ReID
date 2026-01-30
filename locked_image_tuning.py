@@ -73,7 +73,7 @@ class PromptLearner(nn.Module):
         prompts = self.prompt[label_pids, :, :]
         prompts = F.dropout(prompts, p=0.05, training=self.training)
         class_name_embedding = self.class_name_embedding.expand(label_pids.size(0), -1, -1)
-        combined_embs = torch.cat([class_name_embedding, prompts], dim=1)
+        combined_embs = torch.cat([prompts, class_name_embedding], dim=1)
         
         prompted_text_features = text_model(inputs_embeds=combined_embs, domain_ids=domain_ids)
         
@@ -142,8 +142,8 @@ def tuning_vision_projection(dataset_names,
     real_sup_con_loss = SupConLoss(device)
     info_nce_loss = MMSupConAndProxyCE(alpha_ce=1.0, alpha_rank=0.)
     scaler = GradScaler(device)
-    optimizer = torch.optim.Adam(all_trainable_params, lr=2e-3, weight_decay=1e-4)
-    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-3)
+    optimizer = torch.optim.Adam(all_trainable_params, lr=5e-4, weight_decay=1e-4)
+    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-4)
     
     frozen_text_features_list = []
     with torch.inference_mode():
@@ -157,13 +157,31 @@ def tuning_vision_projection(dataset_names,
     
     # --- Training Loop ---
     num_batches = max(len(loader) for loader in train_dataloaders) * len(train_dataloaders)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #     optimizer,
+    #     max_lr=5e-4,
+    #     total_steps=num_batches * N_EPOCHS_PRESTAGE,
+    #     pct_start=0.1,
+    #     div_factor=10,
+    #     final_div_factor=10
+    # )
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
-        max_lr=5e-4,
-        total_steps=num_batches * N_EPOCHS_PRESTAGE,
-        pct_start=0.1,
-        div_factor=10,
-        final_div_factor=10
+        schedulers=[
+            torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,      
+                end_factor=1.0,
+                total_iters=10
+            ), 
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, 
+                T_max=N_EPOCHS_PRESTAGE-10, 
+                eta_min=1e-6
+            )
+        ],
+        milestones=[10]
     )
 
     for epoch in range(N_EPOCHS_PRESTAGE):
@@ -189,10 +207,9 @@ def tuning_vision_projection(dataset_names,
             with autocast(device):
                 image_features_batch_2 = base_model.get_image_features(image_tensor_2.to(device), domain_ids=domain_batch)[0]
                 logits = classifiers[i](image_features_batch_2)
-                with torch.no_grad():
-                    image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
-                    
-            image_features_batch = image_features_batch.float()
+            with torch.no_grad():
+                image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
+            
             image_features_batch_2 = image_features_batch_2.float()
             logits = logits.float()
             image_classification_loss = F.cross_entropy(logits, label_batch, label_smoothing=0.1)
@@ -208,7 +225,7 @@ def tuning_vision_projection(dataset_names,
             scaler.step(temperature_optimizer)
             scaler.update()
             loss_by_epoch += total_loss.item()
-            scheduler.step()
+        scheduler.step()
 
         print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
     # base_model.vision_model = base_model.vision_model.merge_and_unload()
@@ -280,7 +297,7 @@ def LoRA_tuning_variable_dataset(base_model,
     prompt_learner_optimizer = torch.optim.Adam(
         prompt_learner_params, lr=5e-4, weight_decay=1e-4
     )
-    temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=1e-3)
+    temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=1e-4)
 
     prompt_scheduler = torch.optim.lr_scheduler.SequentialLR(
         prompt_learner_optimizer,

@@ -1,6 +1,7 @@
 import os
 import copy
 import random
+import torch
 import numpy as np
 from collections import defaultdict
 from torchvision import transforms as T
@@ -11,6 +12,29 @@ from base_dataset import ImageDataset
 from constants import *
 from market import Market1501
 from veri import VeRi
+
+
+class LocalizedGray(object):
+    def __init__(self, p=0.3, scale=(0.1, 0.4)):
+        self.p = p
+        self.scale = scale
+
+    def __call__(self, img):
+        if torch.rand(1) > self.p:
+            return img
+
+        C, H, W = img.shape
+        area = H * W
+        target_area = torch.empty(1).uniform_(*self.scale).item() * area
+
+        h = int(torch.sqrt(torch.tensor(target_area)))
+        w = h
+        y = torch.randint(0, H - h + 1, (1,))
+        x = torch.randint(0, W - w + 1, (1,))
+
+        gray = img[:, y:y+h, x:x+w].mean(dim=0, keepdim=True)
+        img[:, y:y+h, x:x+w] = gray.repeat(3, 1, 1)
+        return img
 
 class PKsamplerWithLabels:
     """
@@ -140,9 +164,9 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
             T.Resize(input_size),
             T.RandomHorizontalFlip(0.5),
             T.ColorJitter(
-                brightness=0.4,
-                contrast=0.4,
-                saturation=0.3,
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.15,
                 hue=0.1,
             ),
             T.Pad(10),
@@ -155,17 +179,12 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
         preprocessing = T.Compose([
             T.Resize(input_size),
             T.RandomHorizontalFlip(0.5),
-            T.ColorJitter(
-                brightness=0.4,
-                contrast=0.4,
-                saturation=0.3,
-                hue=0.1,
-            ),
             T.Pad(10),
             T.RandomCrop(input_size),
             T.ToTensor(),
             T.Normalize(mean=0.5, std=0.5),
-            T.RandomErasing(),
+            T.RandomErasing(p=0.25),
+            LocalizedGray(p=0.25, scale=(0.1, 0.3)),
         ])
     else:
         preprocessing = T.Compose([

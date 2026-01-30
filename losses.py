@@ -137,8 +137,8 @@ class MMSupConAndProxyCE(nn.Module):
         Batch-proxy CE: image -> class proxy among P batch classes.
         """
         T = self._T().float()
-        img = F.normalize(image_features.float(), dim=1, eps=1e-6)
-        txt = F.normalize(text_features.float(), dim=1, eps=1e-6)
+        img = F.normalize(image_features, dim=1, eps=1e-6)
+        txt = F.normalize(text_features, dim=1, eps=1e-6)
 
         _, class_txt, inv = self._mean_by_class(txt, pid_labels)   # [P,D], inv:[B]
         class_txt = F.normalize(class_txt, dim=1, eps=1e-6)
@@ -154,9 +154,9 @@ class MMSupConAndProxyCE(nn.Module):
         near_miss_features: [B,D] duplicated per class with PK; collapsed to [P,D].
         """
         T = self._T().float()
-        img = F.normalize(image_features.float(), dim=1, eps=1e-6)
-        txt = F.normalize(text_features.float(), dim=1, eps=1e-6)
-        nm = F.normalize(near_miss_features.float(), dim=1, eps=1e-6)
+        img = F.normalize(image_features, dim=1, eps=1e-6)
+        txt = F.normalize(text_features, dim=1, eps=1e-6)
+        nm = F.normalize(near_miss_features, dim=1, eps=1e-6)
 
         _, class_txt, inv = self._mean_by_class(txt, pid_labels)   # [P,D], inv:[B]
         class_txt = F.normalize(class_txt, dim=1, eps=1e-6)
@@ -165,8 +165,8 @@ class MMSupConAndProxyCE(nn.Module):
         class_nm = F.normalize(class_nm, dim=1, eps=1e-6)
 
         # per-sample sims to its class proxies
-        s_soft = (img * class_txt[inv]).sum(dim=1) / T  # [B]
-        s_nm = (img * class_nm[inv]).sum(dim=1) / T     # [B]
+        s_soft = (img * class_txt[inv]).sum(dim=1)  # [B]
+        s_nm = (img * class_nm[inv]).sum(dim=1)     # [B]
 
         # hinge ranking
         return F.relu(self.rank_margin + s_nm - s_soft).mean()
