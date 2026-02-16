@@ -136,8 +136,9 @@ def vision_tuning(
             last_hidden_state = last_hidden_state.float()
             
             # Cross-entropy loss
-            logits = classifiers[i](image_features) + classifiers[i+(len(classifiers)>>1)](image_attention)
-            loss_ce = 0.25 * criterion[i](logits, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embeddings[i]).t() / 0.07, label)
+            logits = classifiers[i](image_features)
+            logits_preproj = classifiers[i+(len(classifiers)>>1)](image_attention)
+            loss_ce = 0.25 * criterion[i](logits, label) + 0.25 * criterion[i](logits_preproj, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embeddings[i]).t() / 0.07, label)
 
             loss_triplet = mine_hard_triplets(image_features, label) + mine_hard_triplets(image_attention, label)
 
