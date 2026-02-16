@@ -4,7 +4,7 @@ from data_preparation import *
 from checkpoint import *
 from losses import TokenMaxSimLoss, mine_hard_triplets, MMSupConAndProxyCE
 from evaluation import R1_mAP_eval_pt
-from locked_image_tuning import tuning_vision_projection, LoRA_tuning_variable_dataset
+from locked_image_tuning import tuning_vision_projection, prompt_tuning_variable_dataset
 
 import torch
 import torch.nn as nn
@@ -34,7 +34,7 @@ def vision_tuning(
         base_model, prompt_learners, _, _, _, _ = load_checkpoint(base_model, prompt_learners, None, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
-    classifier_params = [] # <-- Store classifier params here first
+    classifier_params = []
 
     for dataset_name, input_size, classifier in zip(dataset_names, input_sizes, classifiers):
         train_dataloader, _, _, _ = create_dataloader(dataset_name, input_size, "train", True)
@@ -129,18 +129,17 @@ def vision_tuning(
             label = label.to(device)
 
             with autocast(device, torch.float16):
-                image_features, image_features_domain, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False, domain_ids=i)
+                image_features, image_attention, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False, domain_ids=i)
             
             image_features = image_features.float()
-            image_features_domain = image_features_domain.float()
+            image_attention = image_attention.float()
             last_hidden_state = last_hidden_state.float()
             
             # Cross-entropy loss
-            logits = classifiers[i](image_features)
+            logits = classifiers[i](image_features) + classifiers[i+(len(classifiers)>>1)](image_attention)
             loss_ce = 0.25 * criterion[i](logits, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embeddings[i]).t() / 0.07, label)
 
-            loss_triplet = mine_hard_triplets(image_features, label)
-            # loss_sup_con = sup_con_loss(image_features, modified_text_embeddings[i][label], label, None, False)
+            loss_triplet = mine_hard_triplets(image_features, label) + mine_hard_triplets(image_attention, label)
 
             # MaxSim loss
             loss_maxsim = token_max_sim_loss(last_hidden_state, modified_text_embeddings[i], label)
@@ -204,7 +203,7 @@ if __name__ == "__main__":
         cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE, False)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()    
-    base_model, prompt_learners = LoRA_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
+    base_model, prompt_learners = prompt_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
 
     # Run LoRA vision tuning
     model = vision_tuning(base_model, prompt_learners, classifiers, dataset_names, input_sizes, DEVICE)

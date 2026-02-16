@@ -438,10 +438,10 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
 
         residual = hidden_state
-        hidden_state = self.layernorm(hidden_state)
-        hidden_state = residual + self.mlp(hidden_state)
+        hidden_state_pre = self.layernorm(hidden_state)
+        hidden_state = residual + self.mlp(hidden_state_pre)
 
-        return hidden_state[:, 0]
+        return hidden_state[:, 0], hidden_state_pre[:, 0]
 
 
 class SiglipVisionTransformer(nn.Module):
@@ -455,7 +455,6 @@ class SiglipVisionTransformer(nn.Module):
         self.encoder = Siglip2Encoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self.head = SiglipMultiheadAttentionPoolingHead(config)
-        self.dal = DAL(config.num_domains, embed_dim)
 
     @staticmethod
     def convert_image_to_patches(image: torch.FloatTensor, patch_size: int) -> torch.FloatTensor:
@@ -500,10 +499,9 @@ class SiglipVisionTransformer(nn.Module):
 
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
-        pooler_output = self.head(last_hidden_state)
-        pooler_output_domain = self.dal(pooler_output, domain_ids)
+        pooler_output, attention_output = self.head(last_hidden_state)
 
-        return pooler_output, pooler_output_domain, last_hidden_state
+        return pooler_output, attention_output, last_hidden_state
 
 
 class SiglipVisionModel(nn.Module):

@@ -1,6 +1,5 @@
 import glob
 import base64
-import requests
 import random
 import json
 from collections import defaultdict
@@ -30,50 +29,56 @@ def generate_batch_requests(base_path, class_name, dataset, input_size):
         image_list[label].append(image_path)
 
     assert len(image_list) < 1000
+    if class_name == "person":
+        user_prompt = f"Keep image with size of {input_size}. Focus on the {class_name} in the photos. Summarize the common parts of the {class_name}'s top, bottom and shoes and avoid camera angle, viewpoint and behavior in one sentence and under 30 words starting with 'A photo of a'."
+    else:
+        user_prompt = f"Keep image with size of {input_size}. Focus on the {class_name} in the photos. Summarize the common parts of the {class_name}'s appearance and avoid camera angle, viewpoint and behavior in one sentence and under 30 words starting with 'A photo of a'."
 
     with open(f"requests_{dataset}_full.jsonl", "w+") as f:
         for label in image_list:
 
             model = "gpt-5-mini"
 
-            image_path, image_path2 = random.sample(image_list[label], 2)
+            for attempt in range(2):
 
-            # Getting the base64 string
-            base64_image = encode_image(image_path)
-            base64_image2 = encode_image(image_path2)
+                image_path, image_path2 = random.sample(image_list[label], 2)
 
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Keep image with size of {input_size}. Focus on the {class_name} in the photos. Summarize the common parts of the {class_name}'s appearance and exclude behavior in one sentence and under 30 words starting with 'A photo of a'."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                # Getting the base64 string
+                base64_image = encode_image(image_path)
+                base64_image2 = encode_image(image_path2)
+
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": user_prompt
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image2}"
+                                    }
                                 }
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image2}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_completion_tokens": 1536
-            }
+                            ]
+                        }
+                    ],
+                    "max_completion_tokens": 1536
+                }
 
-            request = {"custom_id":str(label),"method":"POST","url":"/v1/chat/completions","body":payload}
+                request = {"custom_id": "_".join((str(label), str(attempt))),"method": "POST", "url": "/v1/chat/completions", "body": payload}
 
 
-            f.write(json.dumps(request) + "\n")
+                f.write(json.dumps(request) + "\n")
 
 '''
 # Upload the file
@@ -108,7 +113,7 @@ def generate_descriptions(result_path, dataset):
             if not line:
                 continue
             raw = json.loads(line)
-            custom_id = int(raw["custom_id"])
+            custom_id = int(raw["custom_id"].split("_")[0])
             response = raw["response"]["body"]["choices"][0]["message"]["content"]
             rows.append((custom_id, response))
     rows.sort(key=lambda x: x[0])
