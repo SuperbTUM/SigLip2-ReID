@@ -173,8 +173,7 @@ def vision_tuning(
 def test(model,
          dataset_name,
          input_size,
-         device,
-         with_domain):
+         device):
     validation_dataloader, num_query, _, _ = create_dataloader(dataset_name, input_size, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     with torch.inference_mode():
@@ -184,11 +183,8 @@ def test(model,
             label = label.to(device)
             cam = cam.to(device)
             domain_ids = torch.zeros_like(label) if dataset_name == "Market1501" else torch.ones_like(label)
-            if with_domain:
-                test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_ids=domain_ids)[1]
-            else:
-                test_feat = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_ids=domain_ids)[0]
-            evaluator.update((test_feat, label, cam))
+            test_feat, test_attention = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_ids=domain_ids)[:2]
+            evaluator.update((torch.cat((test_feat, test_attention), dim=1), label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()
     return cmc[0], cmc[4], cmc[9], mAP
@@ -201,7 +197,7 @@ if __name__ == "__main__":
     # Get the pre-tuned base model and prompt learners from locked image tuning
     base_model, classifiers = tuning_vision_projection(dataset_names, input_sizes, DEVICE)
     for i, dataset_name in enumerate(dataset_names):
-        cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE, False)
+        cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()    
     base_model, prompt_learners = prompt_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
@@ -210,7 +206,7 @@ if __name__ == "__main__":
     model = vision_tuning(base_model, prompt_learners, classifiers, dataset_names, input_sizes, DEVICE)
     
     for i, dataset_name in enumerate(dataset_names):
-        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE, False)
+        cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE)
         print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
         torch.cuda.empty_cache()
 

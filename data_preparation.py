@@ -163,17 +163,18 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
     strong_augment_preprocessing = T.Compose([
             T.Resize(input_size),
             T.RandomHorizontalFlip(0.5),
-            T.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.15,
-                hue=0.1,
-            ),
+            # T.ColorJitter(
+            #     brightness=0.2,
+            #     contrast=0.2,
+            #     saturation=0.15,
+            #     hue=0.1,
+            # ),
             T.Pad(10),
             T.RandomCrop(input_size),
             T.ToTensor(),
             T.Normalize(mean=0.5, std=0.5),
-            T.RandomErasing(p=1.0),
+            T.RandomErasing(p=0.25),
+            LocalizedGray(p=0.25, scale=(0.1, 0.3)),
         ])
     if augmented:
         preprocessing = T.Compose([
@@ -198,7 +199,7 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
         dataset = VeRi(verbose=False)
     if type == "train":
         if dual_branch:
-            preprocessed_dataset = ImageDataset(dataset.train, strong_augment_preprocessing, weak_augment_preprocessing)
+            preprocessed_dataset = ImageDataset(dataset.train, weak_augment_preprocessing, strong_augment_preprocessing)
         else:
             preprocessed_dataset = ImageDataset(dataset.train, preprocessing)
         if use_ai_prompts:

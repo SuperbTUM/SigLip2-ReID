@@ -133,13 +133,16 @@ def tuning_vision_projection(dataset_names,
         # Add its parameters to the list
         classifier_params.extend(list(classifier.parameters()))
         classifier_params.extend(list(classifier_nonproj.parameters()))
-    
-    all_trainable_params = list(filter(lambda p: p.requires_grad, base_model.parameters())) + classifier_params
 
     real_sup_con_loss = SupConLoss(device)
     info_nce_loss = MMSupConAndProxyCE(alpha_ce=1.0, alpha_rank=0.)
     scaler = GradScaler(device)
-    optimizer = torch.optim.Adam(all_trainable_params, lr=5e-4, weight_decay=1e-4)
+    base_lr = 1e-4
+    params = [
+        {'params': list(filter(lambda p: p.requires_grad, base_model.parameters())), 'lr': base_lr, 'weight_decay': 1e-4},
+        {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
+    ]
+    optimizer = torch.optim.Adam(params, lr=1e-4, weight_decay=1e-4)
     temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-4)
     
     frozen_text_features_list = []
@@ -206,27 +209,30 @@ def tuning_vision_projection(dataset_names,
             frozen_text_feature = frozen_text_features_list[i][label_batch]
 
             with autocast(device):
-                image_features_batch_2, image_attention_batch_2 = base_model.get_image_features(image_tensor_2.to(device), domain_ids=domain_batch)[:2]
+                image_features_batch_2, image_attention_batch_2, image_last_hidden_state_batch_2 = base_model.get_image_features(image_tensor_2.to(device), domain_ids=domain_batch)
                 logits = classifiers[i](image_features_batch_2)
                 logits_nonproj = classifiers_nonproj[i](image_attention_batch_2)
-            with torch.no_grad():
-                image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
+            # with torch.no_grad():
+            #     image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
             
             image_features_batch_2 = image_features_batch_2.float()
             image_attention_batch_2 = image_attention_batch_2.float()
+            image_last_hidden_state_batch_2 = image_last_hidden_state_batch_2.mean(dim=1).float()
             logits = logits.float()
             logits_nonproj = logits_nonproj.float()
             image_classification_loss = F.cross_entropy(logits, label_batch, label_smoothing=0.1) + F.cross_entropy(logits_nonproj, label_batch, label_smoothing=0.1)
-            image_contrastive_loss = real_sup_con_loss(image_features_batch, image_features_batch_2, label_batch, label_batch, True) + \
-                                        mine_hard_triplets(image_features_batch_2, label_batch) + mine_hard_triplets(image_attention_batch_2, label_batch)
+            image_contrastive_loss = \
+                            mine_hard_triplets(image_features_batch_2, label_batch) + mine_hard_triplets(image_attention_batch_2, label_batch) + \
+                            mine_hard_triplets(image_last_hidden_state_batch_2, label_batch)
+            # This loss should not use strong augmentation
             image_text_loss = info_nce_loss(image_features_batch_2, frozen_text_feature.detach(), label_batch, None, False)
 
-            loss = image_contrastive_loss + image_classification_loss + 0.1 * image_text_loss 
+            loss = image_contrastive_loss + image_classification_loss #+ 0.1 * image_text_loss 
             total_loss += loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
-            scaler.step(temperature_optimizer)
+            # scaler.step(temperature_optimizer)
             scaler.update()
             loss_by_epoch += total_loss.item()
         scheduler.step()
