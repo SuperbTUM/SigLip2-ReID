@@ -216,4 +216,4 @@ def create_dataloader(dataset_name, input_size, type, augmented, use_ai_prompts=
                             shuffle=not augmented, 
                             sampler=RandomIdentitySampler(dataset.train, BATCH_SIZE, N_INSTANCE) if augmented else None,
                             num_workers=N_WORKER)
-    return dataloader, None if type == "train" else len(dataset.query), dataset.num_train_pids if type == "train" else None, ai_prompts if type == "train" else None
+    return dataloader, None if type == "train" else len(dataset.query), dataset.num_train_pids if type == "train" else None, ai_prompts if type == "train" else None, dataset.num_train_cams

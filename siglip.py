@@ -125,7 +125,6 @@ class SiglipVisionEmbedding(nn.Module):
         else:
             self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
-        self.num_domains = config.num_domains
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
         self.register_buffer(
             "position_ids",
@@ -197,7 +196,6 @@ class Siglip2VisionEmbeddings(nn.Module):
         self.config = config
         self.embed_dim = config.hidden_size
         self.patch_size = config.patch_size
-        self.num_domains = config.num_domains
 
         self.patch_embedding = nn.Linear(
             in_features=config.num_channels * self.patch_size * self.patch_size,
@@ -485,7 +483,7 @@ class SiglipVisionTransformer(nn.Module):
             mask[:, -padding_length:] = 0
         return image, mask
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None, domain_ids = None) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None) -> torch.Tensor:
         # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embedding_Dimension]
         attention_mask = None
         if self.config.version == "siglip":
@@ -511,14 +509,14 @@ class SiglipVisionModel(nn.Module):
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool, domain_ids: torch.Tensor) -> Tuple:
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
         bs, _, h, w = pixel_values.shape
         spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
-        pooler_output, pooler_output_domain, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
-                                                                                   spatial_shapes=spatial_shapes, domain_ids=domain_ids)
+        pooler_output, pooler_attention, last_hidden_state = self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
+                                                                                   spatial_shapes=spatial_shapes)
         
-        return pooler_output, pooler_output_domain, last_hidden_state
+        return pooler_output, pooler_attention, last_hidden_state
 
 
 class SiglipTextConfig:
@@ -661,8 +659,7 @@ class Siglip2TextTransformer(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
-            domain_ids: Optional[torch.Tensor] = None
+            inputs_embeds: Optional[torch.Tensor] = None
     ):
         r"""
         Returns:
@@ -718,8 +715,7 @@ class SiglipTextModel(nn.Module):
             self,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
-            domain_ids: Optional[torch.Tensor] = None
+            inputs_embeds: Optional[torch.Tensor] = None
     ):
         r"""
         Returns:
@@ -729,8 +725,7 @@ class SiglipTextModel(nn.Module):
         pooler_output = self.text_model(
                                             input_ids=input_ids,
                                             attention_mask=attention_mask,
-                                            inputs_embeds=inputs_embeds,
-                                            domain_ids=domain_ids
+                                            inputs_embeds=inputs_embeds
         )
         return pooler_output
 
@@ -805,8 +800,7 @@ class SiglipModel(nn.Module):
     def get_text_features(
             self,
             input_ids: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            domain_ids: Optional[torch.Tensor] = None
+            attention_mask: Optional[torch.Tensor] = None
     ) -> torch.FloatTensor:
         r"""
         Returns:
@@ -818,8 +812,7 @@ class SiglipModel(nn.Module):
 
         pooled_output = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            domain_ids=domain_ids
+            attention_mask=attention_mask
         )
 
         return pooled_output
@@ -827,8 +820,7 @@ class SiglipModel(nn.Module):
     def get_image_features(
             self,
             pixel_values: Optional[torch.FloatTensor] = None,
-            interpolate_pos_encoding: bool = False,
-            domain_ids = None
+            interpolate_pos_encoding: bool = False
     ) -> torch.FloatTensor:
         r"""
         Returns:
@@ -838,13 +830,12 @@ class SiglipModel(nn.Module):
         ```"""
         # Use SiglipModel's config for some fields (if specified) instead of those of vision & text components.
 
-        pooled_output, pooled_output_domain, last_hidden_state = self.vision_model(
+        pooled_output, pooled_attention, last_hidden_state = self.vision_model(
             pixel_values=pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-            domain_ids=domain_ids
+            interpolate_pos_encoding=interpolate_pos_encoding
         )
 
-        return pooled_output, pooled_output_domain, last_hidden_state
+        return pooled_output, pooled_attention, last_hidden_state
 
     def forward(
             self,

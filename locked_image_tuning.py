@@ -26,11 +26,14 @@ class PromptLearner(nn.Module):
                  device,
                  class_names: List[str],
                  n_cls,
+                 n_cams,
                  init_prompts: List[str] = None):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
         self.n_cls = n_cls
+        self.cam_embedding = nn.Embedding(n_cams, embedding_dim, device=device)
+        nn.init.normal_(self.cam_embedding.weight, std=0.01)
 
         # Store tokenized class names
         self.class_names = class_names
@@ -62,7 +65,7 @@ class PromptLearner(nn.Module):
         self.register_buffer("class_name_embedding", class_embedding)
         self.register_buffer("ai_text_embedding", ai_text_embedding)
 
-    def forward(self, text_model, domain_ids, label_pids):
+    def forward(self, text_model, label_pids, cam_ids):
         # --- Mix the AI-generated and learnable prompts ---
         # prompt: (N, P, D)
         # ai_prompt_embs: (N, L, D)
@@ -70,11 +73,13 @@ class PromptLearner(nn.Module):
         # Append the learnable prompt to the class name embeddings
         # [PROMPT, PROMPT, ..., CLASS_NAME]
         prompts = self.prompt[label_pids, :, :]
+        cam_prompts = self.cam_embedding(cam_ids)
         prompts = F.dropout(prompts, p=0.05, training=self.training)
         class_name_embedding = self.class_name_embedding.expand(label_pids.size(0), -1, -1)
         combined_embs = torch.cat([prompts, class_name_embedding], dim=1)
+        combined_embs[:, -1, :] = combined_embs[:, -1, :] + cam_prompts
         
-        prompted_text_features = text_model(inputs_embeds=combined_embs, domain_ids=domain_ids)
+        prompted_text_features = text_model(inputs_embeds=combined_embs)
         
         return prompted_text_features
 
@@ -108,7 +113,7 @@ def tuning_vision_projection(dataset_names,
     train_dataloaders = []
     n_clses = []
     for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls, _ = create_dataloader(dataset_name, input_size, "train", True, False, True)
+        train_dataloader, _, n_cls, _, _ = create_dataloader(dataset_name, input_size, "train", True, False, True)
         train_dataloaders.append(train_dataloader)
         n_clses.append(n_cls)
 
@@ -137,12 +142,12 @@ def tuning_vision_projection(dataset_names,
     real_sup_con_loss = SupConLoss(device)
     info_nce_loss = MMSupConAndProxyCE(alpha_ce=1.0, alpha_rank=0.)
     scaler = GradScaler(device)
-    base_lr = 1e-4
+    base_lr = 5e-4
     params = [
         {'params': list(filter(lambda p: p.requires_grad, base_model.parameters())), 'lr': base_lr, 'weight_decay': 1e-4},
         {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
     ]
-    optimizer = torch.optim.Adam(params, lr=1e-4, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(params, lr=base_lr, weight_decay=1e-4)
     temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-4)
     
     frozen_text_features_list = []
@@ -205,15 +210,14 @@ def tuning_vision_projection(dataset_names,
             total_loss = 0
 
             label_batch = label_batch.to(device)
-            domain_batch = i % 1
-            frozen_text_feature = frozen_text_features_list[i][label_batch]
+            # frozen_text_feature = frozen_text_features_list[i][label_batch]
 
             with autocast(device):
-                image_features_batch_2, image_attention_batch_2, image_last_hidden_state_batch_2 = base_model.get_image_features(image_tensor_2.to(device), domain_ids=domain_batch)
+                image_features_batch_2, image_attention_batch_2, image_last_hidden_state_batch_2 = base_model.get_image_features(image_tensor_2.to(device))
                 logits = classifiers[i](image_features_batch_2)
                 logits_nonproj = classifiers_nonproj[i](image_attention_batch_2)
             # with torch.no_grad():
-            #     image_features_batch = base_model.get_image_features(image_tensor.to(device), domain_ids=domain_batch)[0]
+            #     image_features_batch = base_model.get_image_features(image_tensor.to(device))[0]
             
             image_features_batch_2 = image_features_batch_2.float()
             image_attention_batch_2 = image_attention_batch_2.float()
@@ -225,7 +229,7 @@ def tuning_vision_projection(dataset_names,
                             mine_hard_triplets(image_features_batch_2, label_batch) + mine_hard_triplets(image_attention_batch_2, label_batch) + \
                             mine_hard_triplets(image_last_hidden_state_batch_2, label_batch)
             # This loss should not use strong augmentation
-            image_text_loss = info_nce_loss(image_features_batch_2, frozen_text_feature.detach(), label_batch, None, False)
+            # image_text_loss = info_nce_loss(image_features_batch_2, frozen_text_feature.detach(), label_batch, None, False)
 
             loss = image_contrastive_loss + image_classification_loss #+ 0.1 * image_text_loss 
             total_loss += loss
@@ -268,7 +272,7 @@ def prompt_tuning_variable_dataset(base_model,
     prompt_learner_params = []
 
     for dataset_name, input_size, class_names in zip(dataset_names, input_sizes, class_names_list):
-        train_dataloader, _, n_cls, ai_prompts = create_dataloader(dataset_name, input_size, "train", False, True)
+        train_dataloader, _, n_cls, ai_prompts, n_cams = create_dataloader(dataset_name, input_size, "train", False, True)
         train_dataloaders.append(train_dataloader)
         n_clses.append(n_cls)
         full_prompts.append(text_tokenizer(ai_prompts, padding=True, return_tensors="pt").input_ids.to(device))
@@ -283,7 +287,8 @@ def prompt_tuning_variable_dataset(base_model,
             embedding_dim=embedding_dim,
             device=device,
             class_names=class_names,
-            n_cls=n_cls
+            n_cls=n_cls,
+            n_cams=n_cams
         )
         prompt_learner = prompt_learner.train()
         prompt_learners.append(prompt_learner)
@@ -317,6 +322,7 @@ def prompt_tuning_variable_dataset(base_model,
     # --- Pre-extract image features for all datasets ---
     image_features_lists = []
     image_label_lists = []
+    image_cam_lists = []
     frozen_text_features_list = []
     with torch.inference_mode():
         batch_size = 32
@@ -333,16 +339,19 @@ def prompt_tuning_variable_dataset(base_model,
         for i, train_dataloader in enumerate(train_dataloaders):
             image_features_list = []
             image_label_list = []
+            image_cam_list = []
             for batch in train_dataloader:
-                image_tensor, label = batch[:2]
+                image_tensor, label, cam = batch[:3]
                 image_tensor = image_tensor.to(device)
                 label = label.to(device)
-                domain_ids = i
-                image_features = lora_model.get_image_features(image_tensor, domain_ids=domain_ids)[0]
+                cam = cam.to(device)
+                image_features = lora_model.get_image_features(image_tensor)[0]
                 image_features_list.append(image_features)
                 image_label_list.append(label)
+                image_cam_list.append(cam)
             image_features_lists.append(torch.cat(image_features_list, dim=0))
             image_label_lists.append(torch.cat(image_label_list, dim=0))
+            image_cam_lists.append(torch.cat(image_cam_list, dim=0))
         # teacher_model_outputs = teacher_model_output(train_dataloaders, ai_prompts)
     # --- Samplers for each dataset ---
     pk_samplers = [
@@ -370,12 +379,12 @@ def prompt_tuning_variable_dataset(base_model,
             indices_batch, label_batch = next(sampler_iter)
             
             image_features_batch = image_features_lists[i][indices_batch]
+            image_cams_batch = image_cam_lists[i][indices_batch]
             label_batch = torch.tensor(label_batch, device=device)
             frozen_text_features_batch = frozen_text_features_list[i][label_batch]
-            domain_batch = i % 1
 
             with autocast(device):
-                text_features = prompt_learners[i](lora_model.text_model, domain_batch, label_batch)
+                text_features = prompt_learners[i](lora_model.text_model, label_batch, image_cams_batch)
             
             text_features = text_features.float()
             loss = sup_con_loss(image_features_batch, text_features, label_batch, frozen_text_features_batch, False)

@@ -37,7 +37,7 @@ def vision_tuning(
     classifier_params = []
 
     for dataset_name, input_size, classifier in zip(dataset_names, input_sizes, classifiers):
-        train_dataloader, _, _, _ = create_dataloader(dataset_name, input_size, "train", True)
+        train_dataloader, _, _, _, _ = create_dataloader(dataset_name, input_size, "train", True)
         train_dataloaders.append(train_dataloader)
         
         # Add its parameters to the list
@@ -95,15 +95,10 @@ def vision_tuning(
     )
 
     # --- Freeze prompt learners ---
-    modified_text_embeddings = []
-    for i, prompt_learner in enumerate(prompt_learners):
+    for prompt_learner in prompt_learners:
         for param in prompt_learner.parameters():
             param.requires_grad = False
         prompt_learner.eval()
-        with torch.no_grad():
-            n_cls = prompt_learner.n_cls
-            modified_text_embedding = prompt_learner(text_model, i % 1, torch.arange(n_cls, device=device))
-            modified_text_embeddings.append(modified_text_embedding)
 
     # --- Training Loop (with Gradient Accumulation) ---
     accumulation_steps = 2  # Adjust as needed
@@ -124,12 +119,15 @@ def vision_tuning(
             total_loss = 0
             i, dataloader_iter = next(round_robin_iter)
 
-            image_tensor, label, _, _, _ = next(dataloader_iter)
+            image_tensor, label, cam, _, _ = next(dataloader_iter)
             image_tensor = image_tensor.to(device)
             label = label.to(device)
+            cam = cam.to(device)
 
             with autocast(device, torch.float16):
-                image_features, image_attention, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False, domain_ids=i)
+                image_features, image_attention, last_hidden_state = vision_model(pixel_values=image_tensor, interpolate_pos_encoding=False)
+            with torch.no_grad():
+                modified_text_embedding = prompt_learners[i](text_model, label, cam)
             
             image_features = image_features.float()
             image_attention = image_attention.float()
@@ -138,12 +136,12 @@ def vision_tuning(
             # Cross-entropy loss
             logits = classifiers[i](image_features)
             logits_preproj = classifiers[i+(len(classifiers)>>1)](image_attention)
-            loss_ce = 0.25 * criterion[i](logits, label) + 0.25 * criterion[i](logits_preproj, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embeddings[i]).t() / 0.07, label)
+            loss_ce = 0.25 * criterion[i](logits, label) + 0.25 * criterion[i](logits_preproj, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embedding).t() / 0.07, label)
 
             loss_triplet = mine_hard_triplets(image_features, label) + mine_hard_triplets(image_attention, label)
 
             # MaxSim loss
-            loss_maxsim = token_max_sim_loss(last_hidden_state, modified_text_embeddings[i], label)
+            loss_maxsim = token_max_sim_loss(last_hidden_state, modified_text_embedding, label)
             total_loss += loss_ce + loss_triplet + 0.5 * loss_maxsim
 
             # Normalize loss for accumulation
@@ -174,7 +172,7 @@ def test(model,
          dataset_name,
          input_size,
          device):
-    validation_dataloader, num_query, _, _ = create_dataloader(dataset_name, input_size, "val", False)
+    validation_dataloader, num_query, _, _, _ = create_dataloader(dataset_name, input_size, "val", False)
     evaluator = R1_mAP_eval_pt(num_query, 10)
     with torch.inference_mode():
         for batch in validation_dataloader:
@@ -182,8 +180,7 @@ def test(model,
             img = img.to(device)
             label = label.to(device)
             cam = cam.to(device)
-            domain_ids = torch.zeros_like(label) if dataset_name == "Market1501" else torch.ones_like(label)
-            test_feat, test_attention = model.vision_model(pixel_values=img, interpolate_pos_encoding=False, domain_ids=domain_ids)[:2]
+            test_feat, test_attention = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)[:2]
             evaluator.update((torch.cat((test_feat, test_attention), dim=1), label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()
