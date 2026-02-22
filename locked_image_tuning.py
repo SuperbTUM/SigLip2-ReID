@@ -14,6 +14,7 @@ from typing import List
 import itertools
 
 import os
+import math
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -32,6 +33,7 @@ class PromptLearner(nn.Module):
         self.embedding_dim = embedding_dim
         self.num_prompt_tokens = num_prompt_tokens
         self.n_cls = n_cls
+        self.n_cams = n_cams
         self.cam_embedding = nn.Embedding(n_cams, embedding_dim, device=device)
         nn.init.normal_(self.cam_embedding.weight, std=0.01)
 
@@ -294,7 +296,7 @@ def prompt_tuning_variable_dataset(base_model,
         prompt_learners.append(prompt_learner)
         prompt_learner_params.extend(list(prompt_learner.parameters()))
 
-    sup_con_loss = MMSupConAndProxyCE()
+    sup_con_loss = SupConLoss(device)
     scaler = GradScaler(device)
     prompt_learner_optimizer = torch.optim.Adam(
         prompt_learner_params, lr=3.5e-4, weight_decay=1e-4
@@ -353,41 +355,42 @@ def prompt_tuning_variable_dataset(base_model,
             image_label_lists.append(torch.cat(image_label_list, dim=0))
             image_cam_lists.append(torch.cat(image_cam_list, dim=0))
         # teacher_model_outputs = teacher_model_output(train_dataloaders, ai_prompts)
-    # --- Samplers for each dataset ---
-    pk_samplers = [
-        PKsamplerWithLabels(labels.cpu().tolist(), BATCH_SIZE // N_INSTANCE, N_INSTANCE)
-        for labels in image_label_lists
-    ]
     
     # --- Training Loop ---
-    # Use itertools.cycle to handle datasets of different sizes
-    num_batches = max(len(sampler) for sampler in pk_samplers) * len(train_dataloaders)
-
+    samplers = [list(range(len(image_features_list))) for image_features_list in image_features_lists]
     for epoch in range(N_EPOCHS_LoRA):
         loss_by_epoch = 0
 
-        # Create cyclic iterators
-        sampler_iters = [itertools.cycle(sampler) for sampler in pk_samplers]
+        for j in range(len(samplers)):
+            random.shuffle(samplers[j])
+        dataset_indices = [0 for _ in range(len(dataset_names))]
+        num_batches = max(math.ceil(len(sampler) / BATCH_SIZE) for sampler in samplers) * len(samplers)
         
-        for step, (i, sampler_iter) in enumerate(itertools.cycle(enumerate(sampler_iters))):
-            if step >= num_batches:  # stop after desired batches
-                break
+        for i in range(num_batches):
+            dataset_idx = i % len(samplers)
+            interval_start = dataset_indices[dataset_idx]
+            if interval_start == len(image_cam_lists[dataset_idx]):
+                continue
+            interval_end = min(interval_start+BATCH_SIZE, len(image_cam_lists[dataset_idx]))
+            batched_indices = samplers[dataset_idx][interval_start:interval_end]
+
             prompt_learner_optimizer.zero_grad()
             temperature_optimizer.zero_grad()
             total_loss = 0
-
-            indices_batch, label_batch = next(sampler_iter)
             
-            image_features_batch = image_features_lists[i][indices_batch]
-            image_cams_batch = image_cam_lists[i][indices_batch]
-            label_batch = torch.tensor(label_batch, device=device)
-            frozen_text_features_batch = frozen_text_features_list[i][label_batch]
+            image_features_batch = image_features_lists[dataset_idx][batched_indices]
+            image_cams_batch = image_cam_lists[dataset_idx][batched_indices]
+            label_batch = image_label_lists[dataset_idx][batched_indices]
+            dataset_indices[dataset_idx] = interval_end
+            # frozen_text_features_batch = frozen_text_features_list[dataset_idx][label_batch]
 
             with autocast(device):
-                text_features = prompt_learners[i](lora_model.text_model, label_batch, image_cams_batch)
+                text_features = prompt_learners[dataset_idx](lora_model.text_model, label_batch, image_cams_batch)
             
             text_features = text_features.float()
-            loss = sup_con_loss(image_features_batch, text_features, label_batch, frozen_text_features_batch, False)
+            label = label_batch * prompt_learner.n_cams + image_cams_batch
+            loss = sup_con_loss(image_features_batch, text_features, label, label) + \
+            sup_con_loss(text_features, image_features_batch, label, label)
             total_loss += loss
 
             scaler.scale(total_loss).backward()
@@ -401,6 +404,6 @@ def prompt_tuning_variable_dataset(base_model,
     
     for prompt_learner in prompt_learners:
         prompt_learner.eval()
-    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.log_temperature.exp().item(), N_EPOCHS_LoRA, None, prompt_learner_optimizer, prompt_scheduler)
+    save_checkpoint(base_model.eval(), prompt_learners, sup_con_loss.temperature.exp().item(), N_EPOCHS_LoRA, None, prompt_learner_optimizer, prompt_scheduler)
     return base_model.eval(), prompt_learners
 

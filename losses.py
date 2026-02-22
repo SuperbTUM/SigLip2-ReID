@@ -221,33 +221,6 @@ def mine_hard_triplets(features, labels, base_margin=0.3):
     loss = F.relu(hardest_pos_dist - hardest_neg_dist + base_margin)
     return loss.mean()
 
-def collect_trainable_lora_As(model):
-    lora_As = []
-
-    for module in model.modules():
-        if not hasattr(module, "lora_A"):
-            continue
-
-        for lora_A in module.lora_A.values():
-            if lora_A.weight.requires_grad:
-                lora_As.append(lora_A.weight)
-
-    return lora_As
-
-def lora_orthogonality_loss(lora_As):
-    loss = 0.0
-
-    for A in lora_As:
-        A = A.float()     # AMP-safe
-        r = A.size(0)
-
-        # (A Aᵀ − I)
-        gram = A @ A.T
-        I = torch.eye(r, device=A.device)
-        loss = loss + torch.norm(gram - I, p="fro") ** 2
-
-    return loss / len(lora_As)
-
 
 class TokenMaxSimLoss(nn.Module):
     def __init__(self, tau=0.07, attn_tau=0.07, label_smoothing=0.0):
